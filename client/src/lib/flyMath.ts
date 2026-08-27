@@ -92,6 +92,38 @@ export function computeFlyPricing(legs: FlyLegs, chainOptions: ChainLeg[]): FlyP
   };
 }
 
+export type ManualFlyEconomics = {
+  maxLoss: number;
+  maxProfit: number;
+  breakevenLower: number;
+  breakevenUpper: number;
+  rewardToRisk: number | null;
+  isBrokenWing: boolean;
+};
+
+// Same economics formulas as computeFlyPricing, but driven off a manually entered
+// debit instead of a live chain lookup — used for symbols with no options-chain feed (e.g. MES).
+export function deriveFlyEconomics(
+  lowerStrike: number,
+  middleStrike: number,
+  upperStrike: number,
+  contracts: number,
+  debit: number
+): ManualFlyEconomics {
+  const lowerWingWidth = middleStrike - lowerStrike;
+  const upperWingWidth = upperStrike - middleStrike;
+  const isBrokenWing = Math.abs(lowerWingWidth - upperWingWidth) > 0.001;
+  const narrowerWing = Math.min(lowerWingWidth, upperWingWidth);
+
+  const maxLoss = Math.max(debit, 0) * 100 * contracts;
+  const maxProfit = Math.max((narrowerWing - debit) * 100 * contracts, 0);
+  const breakevenLower = lowerStrike + debit;
+  const breakevenUpper = upperStrike - debit;
+  const rewardToRisk = maxLoss > 0 ? maxProfit / maxLoss : null;
+
+  return { maxLoss, maxProfit, breakevenLower, breakevenUpper, rewardToRisk, isBrokenWing };
+}
+
 // R-multiple: realized P&L divided by basis (entry debit paid, i.e. max loss).
 export function rMultiple(realizedPnl: number, basis: number): number | null {
   if (!basis || basis <= 0) return null;

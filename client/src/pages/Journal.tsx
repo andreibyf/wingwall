@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
-import { useFlies, useUpdateFly, useDeleteFly, useSettings, useUpdateSettings } from "@/lib/hooks";
-import { computeJournalStats, rMultiple } from "@/lib/flyMath";
+import { useFlies, useUpdateFly, useDeleteFly, useSettings, useUpdateSettings, useChain } from "@/lib/hooks";
+import { computeFlyPricing, computeJournalStats, rMultiple } from "@/lib/flyMath";
 import { fmtUsd, fmtPct, fmtR, todayIso } from "@/lib/format";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -158,8 +158,30 @@ function FlyRow({ fly, showClose }: { fly: Fly; showClose?: boolean }) {
   const [open, setOpen] = useState(false);
   const [exitDebit, setExitDebit] = useState("");
 
+  const isLive = fly.symbol !== "MES";
+  const { data: chain, isLoading: chainLoading } = useChain(fly.symbol, open && isLive);
+  const currentPricing = useMemo(() => {
+    if (!chain) return null;
+    return computeFlyPricing(
+      {
+        optionType: fly.optionType as "call" | "put",
+        lowerStrike: fly.lowerStrike,
+        middleStrike: fly.middleStrike,
+        upperStrike: fly.upperStrike,
+        contracts: fly.contracts,
+      },
+      chain.options.filter((o) => o.expiration === fly.expiration)
+    );
+  }, [chain, fly]);
+  const liveMid = currentPricing?.midDebit ?? null;
+
   const pnl = fly.status === "closed" ? ((fly.exitDebit ?? 0) - fly.entryDebit) * 100 * fly.contracts : null;
   const r = pnl !== null ? rMultiple(pnl, fly.maxLoss) : null;
+
+  const handlePullMid = () => {
+    if (liveMid === null) return;
+    setExitDebit(liveMid.toFixed(2));
+  };
 
   const handleClose = async () => {
     const ed = parseFloat(exitDebit);
@@ -203,13 +225,35 @@ function FlyRow({ fly, showClose }: { fly: Fly; showClose?: boolean }) {
                 </DialogHeader>
                 <div className="flex flex-col gap-1.5 py-2">
                   <Label className="text-xs">Exit debit (credit received, per share)</Label>
-                  <Input
-                    data-testid="input-exit-debit"
-                    type="number"
-                    value={exitDebit}
-                    onChange={(e) => setExitDebit(e.target.value)}
-                    placeholder="e.g. 4.20"
-                  />
+                  <div className="flex gap-2">
+                    <Input
+                      data-testid="input-exit-debit"
+                      type="number"
+                      value={exitDebit}
+                      onChange={(e) => setExitDebit(e.target.value)}
+                      placeholder="e.g. 4.20"
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="shrink-0"
+                      disabled={!isLive || chainLoading || liveMid === null}
+                      onClick={handlePullMid}
+                      data-testid="button-pull-live-mid"
+                    >
+                      {chainLoading ? "Loading…" : "Pull current mid"}
+                    </Button>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {!isLive
+                      ? "MES has no live feed — enter the exit debit manually."
+                      : chainLoading
+                      ? "Fetching live chain…"
+                      : liveMid !== null
+                      ? `Live mid to close: ${fmtUsd(liveMid)}`
+                      : "Strikes not found in the live chain for this expiration — enter manually."}
+                  </p>
                 </div>
                 <DialogFooter>
                   <Button onClick={handleClose} data-testid="button-confirm-close">Confirm close</Button>

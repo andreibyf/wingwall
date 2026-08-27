@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useChain, useFlies, useCreateFly } from "@/lib/hooks";
-import { computeFlyPricing } from "@/lib/flyMath";
+import { computeFlyPricing, deriveFlyEconomics } from "@/lib/flyMath";
 import { fmtUsd, fmtNum, todayIso } from "@/lib/format";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
@@ -25,6 +25,8 @@ export default function Builder() {
   const [middleStrike, setMiddleStrike] = useState<string>("");
   const [upperStrike, setUpperStrike] = useState<string>("");
   const [contracts, setContracts] = useState<string>("1");
+  const [manualExpiration, setManualExpiration] = useState<string>("");
+  const [manualDebit, setManualDebit] = useState<string>("");
 
   const isLive = SYMBOLS.find((s) => s.value === symbol)?.live ?? false;
   const { data: chain, isLoading: chainLoading, error: chainError } = useChain(symbol, isLive);
@@ -61,23 +63,30 @@ export default function Builder() {
     legs.middleStrike < legs.upperStrike;
 
   const pricing =
-    legsComplete && chain
+    isLive && legsComplete && chain
       ? computeFlyPricing(legs, chain.options.filter((o) => o.expiration === activeExpiration))
       : null;
 
+  const parsedManualDebit = parseFloat(manualDebit);
+  const manualPricing =
+    !isLive && legsComplete && !Number.isNaN(parsedManualDebit)
+      ? deriveFlyEconomics(legs.lowerStrike, legs.middleStrike, legs.upperStrike, legs.contracts, parsedManualDebit)
+      : null;
+
   // Blocked strikes: strikes already committed by open positions in this symbol+expiration.
+  const effectiveExpiration = isLive ? activeExpiration : manualExpiration;
   const blockedStrikes = useMemo(() => {
     if (!flies) return new Set<number>();
     const set = new Set<number>();
     flies
-      .filter((f) => f.status === "open" && f.symbol === symbol && f.expiration === activeExpiration)
+      .filter((f) => f.status === "open" && f.symbol === symbol && f.expiration === effectiveExpiration)
       .forEach((f) => {
         set.add(f.lowerStrike);
         set.add(f.middleStrike);
         set.add(f.upperStrike);
       });
     return set;
-  }, [flies, symbol, activeExpiration]);
+  }, [flies, symbol, effectiveExpiration]);
 
   const collision =
     legsComplete &&
@@ -85,29 +94,56 @@ export default function Builder() {
       blockedStrikes.has(legs.middleStrike) ||
       blockedStrikes.has(legs.upperStrike));
 
+  const canLog = isLive
+    ? !!pricing && pricing.midDebit !== null
+    : !!manualPricing && manualExpiration.trim().length > 0;
+
   const handleLog = async () => {
-    if (!pricing || pricing.midDebit === null) return;
+    if (!canLog) return;
     try {
-      await createFly.mutateAsync({
-        symbol,
-        optionType,
-        structureType: pricing.isBrokenWing ? "bwb" : "symmetric",
-        expiration: activeExpiration,
-        lowerStrike: legs.lowerStrike,
-        middleStrike: legs.middleStrike,
-        upperStrike: legs.upperStrike,
-        contracts: legs.contracts,
-        entryDebit: Number(pricing.midDebit.toFixed(4)),
-        entryDate: todayIso(),
-        status: "open",
-        exitDebit: null,
-        exitDate: null,
-        maxLoss: Math.round(pricing.maxLossMid ?? 0),
-        maxProfit: Math.round(pricing.maxProfit ?? 0),
-        campaignWallId: null,
-        notes: null,
-      });
-      toast({ title: "Fly logged", description: `${symbol} ${activeExpiration} ${legs.lowerStrike}/${legs.middleStrike}/${legs.upperStrike} added to journal.` });
+      if (isLive && pricing && pricing.midDebit !== null) {
+        await createFly.mutateAsync({
+          symbol,
+          optionType,
+          structureType: pricing.isBrokenWing ? "bwb" : "symmetric",
+          expiration: activeExpiration,
+          lowerStrike: legs.lowerStrike,
+          middleStrike: legs.middleStrike,
+          upperStrike: legs.upperStrike,
+          contracts: legs.contracts,
+          entryDebit: Number(pricing.midDebit.toFixed(4)),
+          entryDate: todayIso(),
+          status: "open",
+          exitDebit: null,
+          exitDate: null,
+          maxLoss: Math.round(pricing.maxLossMid ?? 0),
+          maxProfit: Math.round(pricing.maxProfit ?? 0),
+          campaignWallId: null,
+          notes: null,
+        });
+        toast({ title: "Fly logged", description: `${symbol} ${activeExpiration} ${legs.lowerStrike}/${legs.middleStrike}/${legs.upperStrike} added to journal.` });
+      } else if (manualPricing) {
+        await createFly.mutateAsync({
+          symbol,
+          optionType,
+          structureType: manualPricing.isBrokenWing ? "bwb" : "symmetric",
+          expiration: manualExpiration.trim(),
+          lowerStrike: legs.lowerStrike,
+          middleStrike: legs.middleStrike,
+          upperStrike: legs.upperStrike,
+          contracts: legs.contracts,
+          entryDebit: Number(parsedManualDebit.toFixed(4)),
+          entryDate: todayIso(),
+          status: "open",
+          exitDebit: null,
+          exitDate: null,
+          maxLoss: Math.round(manualPricing.maxLoss),
+          maxProfit: Math.round(manualPricing.maxProfit),
+          campaignWallId: null,
+          notes: null,
+        });
+        toast({ title: "Fly logged", description: `${symbol} ${manualExpiration.trim()} ${legs.lowerStrike}/${legs.middleStrike}/${legs.upperStrike} added to journal.` });
+      }
     } catch (e: any) {
       toast({ title: "Failed to log fly", description: e.message, variant: "destructive" });
     }
@@ -151,9 +187,20 @@ export default function Builder() {
           </div>
 
           {!isLive && (
-            <div className="rounded-md border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
-              MES has no free public options-chain feed (CME product, not Cboe-listed). Enter strikes manually — economics can't be auto-priced here.
-            </div>
+            <>
+              <div className="rounded-md border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
+                MES has no free public options-chain feed (CME product, not Cboe-listed). Enter strikes and pricing manually below.
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <Label className="text-xs">Expiration</Label>
+                <Input
+                  data-testid="input-manual-expiration"
+                  type="date"
+                  value={manualExpiration}
+                  onChange={(e) => setManualExpiration(e.target.value)}
+                />
+              </div>
+            </>
           )}
 
           {isLive && (
@@ -231,6 +278,20 @@ export default function Builder() {
             />
           </div>
 
+          {!isLive && (
+            <div className="flex flex-col gap-1.5">
+              <Label className="text-xs">Entry debit (per share, manual)</Label>
+              <Input
+                data-testid="input-manual-debit"
+                type="number"
+                step="0.01"
+                value={manualDebit}
+                onChange={(e) => setManualDebit(e.target.value)}
+                placeholder="e.g. 12.50"
+              />
+            </div>
+          )}
+
           {collision && (
             <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive" data-testid="warning-blocked-strikes">
               One or more strikes are already committed by an open position in this symbol/expiration. Verify against the blocked-strikes list before sending.
@@ -239,7 +300,7 @@ export default function Builder() {
 
           <Button
             onClick={handleLog}
-            disabled={!pricing || pricing.midDebit === null || createFly.isPending}
+            disabled={!canLog || createFly.isPending}
             data-testid="button-log-fly"
           >
             {createFly.isPending ? "Logging…" : "Log as open position"}
@@ -252,11 +313,9 @@ export default function Builder() {
             <h2 className="mb-3 text-sm font-semibold">Fly economics</h2>
             {!legsComplete ? (
               <p className="text-sm text-muted-foreground">Enter lower &lt; body &lt; upper strikes to compute economics.</p>
-            ) : !pricing || pricing.midDebit === null ? (
-              <p className="text-sm text-muted-foreground">
-                {isLive ? "Strikes not found in live chain for this expiration." : "No live pricing available for MES — track this fly manually in the Journal."}
-              </p>
-            ) : (
+            ) : isLive && (!pricing || pricing.midDebit === null) ? (
+              <p className="text-sm text-muted-foreground">Strikes not found in live chain for this expiration.</p>
+            ) : isLive && pricing && pricing.midDebit !== null ? (
               <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
                 <Metric label="Mid debit" value={fmtUsd(pricing.midDebit)} sub="per share" />
                 <Metric label="Worst-case debit" value={fmtUsd(pricing.worstDebit)} sub="ask/bid fills" />
@@ -267,13 +326,25 @@ export default function Builder() {
                 <Metric label="Reward:risk" value={pricing.rewardToRiskMid !== null ? `${pricing.rewardToRiskMid.toFixed(2)}:1` : "—"} />
                 <Metric label="Structure" value={pricing.isBrokenWing ? "Broken-wing" : "Symmetric"} />
               </div>
-            )}
+            ) : !isLive && !manualPricing ? (
+              <p className="text-sm text-muted-foreground">Enter a manual entry debit above to compute economics.</p>
+            ) : !isLive && manualPricing ? (
+              <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+                <Metric label="Entry debit" value={fmtUsd(parsedManualDebit)} sub="per share, manual" />
+                <Metric label="Max loss" value={fmtUsd(manualPricing.maxLoss)} tone="negative" />
+                <Metric label="Max profit" value={fmtUsd(manualPricing.maxProfit)} tone="positive" />
+                <Metric label="Reward:risk" value={manualPricing.rewardToRisk !== null ? `${manualPricing.rewardToRisk.toFixed(2)}:1` : "—"} />
+                <Metric label="Breakeven (low)" value={fmtUsd(manualPricing.breakevenLower)} />
+                <Metric label="Breakeven (high)" value={fmtUsd(manualPricing.breakevenUpper)} />
+                <Metric label="Structure" value={manualPricing.isBrokenWing ? "Broken-wing" : "Symmetric"} />
+              </div>
+            ) : null}
           </div>
 
           <div className="rounded-lg border border-card-border bg-card">
             <div className="border-b border-card-border px-4 py-3">
               <h2 className="text-sm font-semibold">
-                {optionType === "call" ? "Calls" : "Puts"} · {activeExpiration || "—"}
+                {optionType === "call" ? "Calls" : "Puts"} · {effectiveExpiration || "—"}
               </h2>
             </div>
             {!isLive ? (
