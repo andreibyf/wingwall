@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
-import { useChain, useFlies, useCreateFly } from "@/lib/hooks";
-import { computeFlyPricing, deriveFlyEconomics } from "@/lib/flyMath";
+import { useChain, useFlies, useCreateFly, useFlyPrice } from "@/lib/hooks";
+import { computeFlyPricing, deriveFlyEconomics, getMultiplier } from "@/lib/flyMath";
 import { fmtUsd, fmtNum, todayIso } from "@/lib/format";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
@@ -62,15 +62,40 @@ export default function Builder() {
     legs.lowerStrike < legs.middleStrike &&
     legs.middleStrike < legs.upperStrike;
 
-  const pricing =
+  const multiplier = getMultiplier(symbol);
+
+  // Live-first pricing via the IBKR-then-Cboe endpoint (QQQ/SPY only). This replaces
+  // the direct client-side computeFlyPricing-over-Cboe-chain call for the economics
+  // panel, while the browse table below still sources its full chain from Cboe.
+  const flyPriceQuery = useFlyPrice(
+    isLive && legsComplete && activeExpiration
+      ? {
+          symbol,
+          optionType,
+          expiration: activeExpiration,
+          lower: legs.lowerStrike,
+          middle: legs.middleStrike,
+          upper: legs.upperStrike,
+          contracts: legs.contracts,
+        }
+      : null,
+    isLive && legsComplete && !!activeExpiration
+  );
+  const livePricing = flyPriceQuery.data ?? null;
+
+  // Fallback client-side pricing straight off the Cboe chain already loaded for the
+  // browse table, used only while the live-price endpoint hasn't returned yet.
+  const chainPricing =
     isLive && legsComplete && chain
-      ? computeFlyPricing(legs, chain.options.filter((o) => o.expiration === activeExpiration))
+      ? computeFlyPricing(legs, chain.options.filter((o) => o.expiration === activeExpiration), multiplier)
       : null;
+
+  const pricing = livePricing && livePricing.midDebit !== null ? livePricing : chainPricing;
 
   const parsedManualDebit = parseFloat(manualDebit);
   const manualPricing =
     !isLive && legsComplete && !Number.isNaN(parsedManualDebit)
-      ? deriveFlyEconomics(legs.lowerStrike, legs.middleStrike, legs.upperStrike, legs.contracts, parsedManualDebit)
+      ? deriveFlyEconomics(legs.lowerStrike, legs.middleStrike, legs.upperStrike, legs.contracts, parsedManualDebit, multiplier)
       : null;
 
   // Blocked strikes: strikes already committed by open positions in this symbol+expiration.
@@ -189,7 +214,7 @@ export default function Builder() {
           {!isLive && (
             <>
               <div className="rounded-md border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
-                MES has no free public options-chain feed (CME product, not Cboe-listed). Enter strikes and pricing manually below.
+                MES has no free public options-chain feed (CME product, not Cboe-listed), and this IBKR account has no CME real-time market-data subscription, so live pricing isn't available either. Enter strikes and pricing manually below (correctly uses the $5/point MES multiplier).
               </div>
               <div className="flex flex-col gap-1.5">
                 <Label className="text-xs">Expiration</Label>
@@ -310,7 +335,18 @@ export default function Builder() {
         {/* Economics + chain */}
         <div className="flex flex-col gap-4">
           <div className="rounded-lg border border-card-border bg-card p-4">
-            <h2 className="mb-3 text-sm font-semibold">Fly economics</h2>
+            <div className="mb-3 flex items-center justify-between">
+              <h2 className="text-sm font-semibold">Fly economics</h2>
+              {isLive && legsComplete && (
+                <Badge variant={livePricing?.source === "ibkr" ? "default" : "secondary"} data-testid="badge-price-source">
+                  {flyPriceQuery.isLoading && !livePricing
+                    ? "Checking live feed…"
+                    : livePricing?.source === "ibkr"
+                    ? "Live via IBKR"
+                    : "Delayed via Cboe"}
+                </Badge>
+              )}
+            </div>
             {!legsComplete ? (
               <p className="text-sm text-muted-foreground">Enter lower &lt; body &lt; upper strikes to compute economics.</p>
             ) : isLive && (!pricing || pricing.midDebit === null) ? (

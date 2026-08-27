@@ -2,7 +2,7 @@ import { useMemo } from "react";
 import { Link } from "wouter";
 import { StatCard } from "@/components/app/StatCard";
 import { useFlies, useCampaignWalls, useSettings } from "@/lib/hooks";
-import { computeJournalStats } from "@/lib/flyMath";
+import { computeJournalStats, getMultiplier } from "@/lib/flyMath";
 import { fmtUsd, fmtPct, fmtR } from "@/lib/format";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
@@ -47,7 +47,7 @@ export default function Overview() {
     );
     let cumulative = 0;
     return sorted.map((f, i) => {
-      const pnl = ((f.exitDebit ?? 0) - f.entryDebit) * 100 * f.contracts;
+      const pnl = ((f.exitDebit ?? 0) - f.entryDebit) * getMultiplier(f.symbol) * f.contracts;
       cumulative += pnl;
       return { trade: i + 1, date: f.exitDate ?? f.entryDate, equity: Number(cumulative.toFixed(2)) };
     });

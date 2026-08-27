@@ -53,6 +53,56 @@ export function useQuote(symbol: string, enabled = true) {
   });
 }
 
+export type FlyPriceResponse = {
+  source: "ibkr" | "cboe" | "unavailable";
+  multiplier: number;
+  spot: number | null;
+  timestamp: string;
+  midDebit: number | null;
+  worstDebit: number | null;
+  maxLossMid: number | null;
+  maxLossWorst: number | null;
+  maxProfit: number | null;
+  breakevenLower: number | null;
+  breakevenUpper: number | null;
+  rewardToRiskMid: number | null;
+  isBrokenWing: boolean;
+  lowerWingWidth: number;
+  upperWingWidth: number;
+};
+
+export type FlyPriceParams = {
+  symbol: string;
+  optionType: "call" | "put";
+  expiration: string;
+  lower: number;
+  middle: number;
+  upper: number;
+  contracts: number;
+};
+
+// Live-first fly pricing: tries the connected IBKR account for QQQ/SPY, falls back
+// to the delayed Cboe chain, reports "unavailable" otherwise (e.g. MES).
+export function useFlyPrice(params: FlyPriceParams | null, enabled = true) {
+  const search = params
+    ? new URLSearchParams({
+        optionType: params.optionType,
+        expiration: params.expiration,
+        lower: String(params.lower),
+        middle: String(params.middle),
+        upper: String(params.upper),
+        contracts: String(params.contracts),
+      }).toString()
+    : "";
+  const url = params ? `/api/fly-price/${params.symbol}?${search}` : "";
+  return useQuery<FlyPriceResponse>({
+    queryKey: [url],
+    enabled: enabled && !!params,
+    refetchInterval: 10_000,
+    staleTime: 5_000,
+  });
+}
+
 // ---- Flies ----
 export function useFlies() {
   return useQuery<Fly[]>({ queryKey: ["/api/flies"] });

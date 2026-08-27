@@ -8,6 +8,8 @@ import {
   insertSettingsSchema,
   insertExecutionChecklistSchema,
 } from "@shared/schema";
+import { computeFlyPricing, getMultiplier, type ChainLeg } from "@shared/flyMath";
+import { getIbkrFlyQuote, isIbkrSupported, IbkrPricingError } from "./ibkr";
 
 const CBOE_BASE = "https://cdn.cboe.com/api/global/delayed_quotes/options";
 const SUPPORTED_SYMBOLS = new Set(["QQQ", "SPY"]);
@@ -108,6 +110,76 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
+  // ---- Live fly pricing (IBKR-first, Cboe fallback) ----
+  // Fetches real-time bid/ask for exactly the 3 legs of a fly — not a full chain.
+  // QQQ/SPY try the connected IBKR account first (real-time SMART-routed equity
+  // options); if that fails for any reason (not connected, expiration/strikes not
+  // found, no live quote) it falls back to the same delayed Cboe chain used
+  // elsewhere in the app. Symbols outside QQQ/SPY (e.g. MES, which has no CME
+  // real-time data on this IBKR account) report source "unavailable".
+  app.get("/api/fly-price/:symbol", async (req, res, next) => {
+    try {
+      const symbol = req.params.symbol.toUpperCase();
+      const optionType = req.query.optionType === "put" ? "put" : "call";
+      const expiration = String(req.query.expiration ?? "");
+      const lowerStrike = Number(req.query.lower);
+      const middleStrike = Number(req.query.middle);
+      const upperStrike = Number(req.query.upper);
+      const contracts = Number(req.query.contracts) || 1;
+
+      if (!expiration || [lowerStrike, middleStrike, upperStrike].some((n) => Number.isNaN(n))) {
+        return res.status(400).json({ message: "expiration, lower, middle, upper are required" });
+      }
+
+      const legs = { optionType, lowerStrike, middleStrike, upperStrike, contracts } as const;
+      const multiplier = getMultiplier(symbol);
+
+      if (isIbkrSupported(symbol)) {
+        try {
+          const quote = await getIbkrFlyQuote(symbol, expiration, optionType, lowerStrike, middleStrike, upperStrike);
+          const pricing = computeFlyPricing(legs, [quote.lowerLeg, quote.middleLeg, quote.upperLeg], multiplier);
+          return res.json({ source: "ibkr", multiplier, spot: quote.spot, timestamp: new Date().toISOString(), ...pricing });
+        } catch (err) {
+          if (!(err instanceof IbkrPricingError)) console.error("IBKR pricing error:", err);
+          // fall through to Cboe fallback below
+        }
+      }
+
+      if (SUPPORTED_SYMBOLS.has(symbol)) {
+        try {
+          const chain = await getChain(symbol);
+          const chainLegs: ChainLeg[] = chain.options.filter((o: any) => o.expiration === expiration);
+          const pricing = computeFlyPricing(legs, chainLegs, multiplier);
+          if (pricing.midDebit !== null) {
+            return res.json({ source: "cboe", multiplier, spot: chain.spot, timestamp: chain.timestamp, ...pricing });
+          }
+        } catch {
+          // fall through to unavailable below
+        }
+      }
+
+      return res.json({
+        source: "unavailable",
+        multiplier,
+        spot: null,
+        timestamp: new Date().toISOString(),
+        midDebit: null,
+        worstDebit: null,
+        maxLossMid: null,
+        maxLossWorst: null,
+        maxProfit: null,
+        breakevenLower: null,
+        breakevenUpper: null,
+        rewardToRiskMid: null,
+        isBrokenWing: Math.abs((middleStrike - lowerStrike) - (upperStrike - middleStrike)) > 0.001,
+        lowerWingWidth: middleStrike - lowerStrike,
+        upperWingWidth: upperStrike - middleStrike,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   // ---- Market data (Cboe proxy) ----
   app.get("/api/quote/:symbol", async (req, res, next) => {
     try {

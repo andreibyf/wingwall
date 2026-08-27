@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
-import { useFlies, useUpdateFly, useDeleteFly, useSettings, useUpdateSettings, useChain } from "@/lib/hooks";
-import { computeFlyPricing, computeJournalStats, rMultiple } from "@/lib/flyMath";
+import { useFlies, useUpdateFly, useDeleteFly, useSettings, useUpdateSettings, useChain, useFlyPrice } from "@/lib/hooks";
+import { computeFlyPricing, computeJournalStats, rMultiple, getMultiplier } from "@/lib/flyMath";
 import { fmtUsd, fmtPct, fmtR, todayIso } from "@/lib/format";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -159,8 +159,30 @@ function FlyRow({ fly, showClose }: { fly: Fly; showClose?: boolean }) {
   const [exitDebit, setExitDebit] = useState("");
 
   const isLive = fly.symbol !== "MES";
-  const { data: chain, isLoading: chainLoading } = useChain(fly.symbol, open && isLive);
-  const currentPricing = useMemo(() => {
+  const multiplier = getMultiplier(fly.symbol);
+
+  // Live-first pricing (IBKR-then-Cboe) for the "pull current mid" button, sourced
+  // from the same endpoint the Builder uses — only fetched while the close dialog is open.
+  const flyPriceQuery = useFlyPrice(
+    isLive
+      ? {
+          symbol: fly.symbol,
+          optionType: fly.optionType as "call" | "put",
+          expiration: fly.expiration,
+          lower: fly.lowerStrike,
+          middle: fly.middleStrike,
+          upper: fly.upperStrike,
+          contracts: fly.contracts,
+        }
+      : null,
+    open && isLive
+  );
+  const livePricing = flyPriceQuery.data ?? null;
+
+  // Fallback: client-side pricing off the Cboe chain, used if the live-price endpoint
+  // hasn't returned a usable value yet.
+  const { data: chain } = useChain(fly.symbol, open && isLive && livePricing?.midDebit == null);
+  const chainPricing = useMemo(() => {
     if (!chain) return null;
     return computeFlyPricing(
       {
@@ -170,12 +192,16 @@ function FlyRow({ fly, showClose }: { fly: Fly; showClose?: boolean }) {
         upperStrike: fly.upperStrike,
         contracts: fly.contracts,
       },
-      chain.options.filter((o) => o.expiration === fly.expiration)
+      chain.options.filter((o) => o.expiration === fly.expiration),
+      multiplier
     );
-  }, [chain, fly]);
-  const liveMid = currentPricing?.midDebit ?? null;
+  }, [chain, fly, multiplier]);
 
-  const pnl = fly.status === "closed" ? ((fly.exitDebit ?? 0) - fly.entryDebit) * 100 * fly.contracts : null;
+  const liveMid = livePricing?.midDebit ?? chainPricing?.midDebit ?? null;
+  const priceSource = livePricing?.source === "ibkr" ? "IBKR" : livePricing?.midDebit != null ? "Cboe" : chainPricing ? "Cboe" : null;
+  const isPullingMid = open && isLive && liveMid === null && (flyPriceQuery.isLoading || flyPriceQuery.isFetching);
+
+  const pnl = fly.status === "closed" ? ((fly.exitDebit ?? 0) - fly.entryDebit) * multiplier * fly.contracts : null;
   const r = pnl !== null ? rMultiple(pnl, fly.maxLoss) : null;
 
   const handlePullMid = () => {
@@ -238,20 +264,20 @@ function FlyRow({ fly, showClose }: { fly: Fly; showClose?: boolean }) {
                       variant="outline"
                       size="sm"
                       className="shrink-0"
-                      disabled={!isLive || chainLoading || liveMid === null}
+                      disabled={!isLive || isPullingMid || liveMid === null}
                       onClick={handlePullMid}
                       data-testid="button-pull-live-mid"
                     >
-                      {chainLoading ? "Loading…" : "Pull current mid"}
+                      {isPullingMid ? "Loading…" : "Pull current mid"}
                     </Button>
                   </div>
                   <p className="text-xs text-muted-foreground">
                     {!isLive
                       ? "MES has no live feed — enter the exit debit manually."
-                      : chainLoading
-                      ? "Fetching live chain…"
+                      : isPullingMid
+                      ? "Fetching live price…"
                       : liveMid !== null
-                      ? `Live mid to close: ${fmtUsd(liveMid)}`
+                      ? `Live mid to close (${priceSource}): ${fmtUsd(liveMid)}`
                       : "Strikes not found in the live chain for this expiration — enter manually."}
                   </p>
                 </div>
