@@ -1,11 +1,12 @@
 import { Link, useLocation } from "wouter";
 import type { ReactNode } from "react";
 import { WingwallLogo } from "./Logo";
-import { LayoutGrid, LineChart, Flag, BookText } from "lucide-react";
+import { LayoutGrid, LineChart, Flag, BookText, Gauge } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const NAV = [
   { href: "/", label: "Overview", icon: LayoutGrid },
+  { href: "/cockpit", label: "Cockpit", icon: Gauge },
   { href: "/builder", label: "Builder", icon: LineChart },
   { href: "/campaign", label: "Campaign", icon: Flag },
   { href: "/journal", label: "Journal", icon: BookText },

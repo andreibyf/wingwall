@@ -1,4 +1,4 @@
-import { users, flies, campaignWalls, settings, executionChecklist } from '@shared/schema';
+import { users, flies, campaignWalls, settings, executionChecklist, journalNotes } from '@shared/schema';
 import type {
   User,
   InsertUser,
@@ -10,25 +10,34 @@ import type {
   InsertSettings,
   ExecutionChecklist,
   InsertExecutionChecklist,
+  JournalNote,
+  InsertJournalNote,
 } from '@shared/schema';
-import { drizzle } from "drizzle-orm/better-sqlite3";
-import Database from "better-sqlite3";
+import { drizzle } from "drizzle-orm/node-postgres";
+import { Pool } from "pg";
 import { eq, desc } from "drizzle-orm";
 
-const sqlite = new Database("data.db");
-sqlite.pragma("journal_mode = WAL");
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is required (Render Postgres connection string)");
+}
 
-export const db = drizzle(sqlite);
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL.includes("localhost") ? false : { rejectUnauthorized: false },
+});
 
-// Bootstrap tables if they don't exist yet (no migration runner in this sandbox).
-sqlite.exec(`
+export const db = drizzle(pool);
+
+// Bootstrap tables if they don't exist yet (no migration runner in this environment).
+export async function ensureSchema(): Promise<void> {
+  await pool.query(`
 CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   username TEXT NOT NULL UNIQUE,
   password TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS flies (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   symbol TEXT NOT NULL,
   option_type TEXT NOT NULL,
   structure_type TEXT NOT NULL DEFAULT 'symmetric',
@@ -46,17 +55,19 @@ CREATE TABLE IF NOT EXISTS flies (
   max_profit REAL NOT NULL,
   campaign_wall_id INTEGER,
   notes TEXT,
+  peak_profit_pct REAL,
+  peak_loss_pct REAL,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS campaign_walls (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   symbol TEXT NOT NULL,
   week_of TEXT NOT NULL,
   wall_price REAL NOT NULL,
   reference_close REAL,
   active_branch TEXT NOT NULL DEFAULT 'pending',
   gap_percent REAL,
-  re_keyed INTEGER NOT NULL DEFAULT 0,
+  re_keyed BOOLEAN NOT NULL DEFAULT false,
   notes TEXT,
   created_at TEXT NOT NULL
 );
@@ -69,15 +80,42 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS execution_checklist (
   id INTEGER PRIMARY KEY,
   week_of TEXT NOT NULL,
-  no_early_fills INTEGER NOT NULL DEFAULT 0,
-  working_window_respected INTEGER NOT NULL DEFAULT 0,
-  clipped_sizing INTEGER NOT NULL DEFAULT 0,
-  blocked_strikes_verified INTEGER NOT NULL DEFAULT 0,
-  fills_logged INTEGER NOT NULL DEFAULT 0,
-  thursday_reserve_deployed INTEGER NOT NULL DEFAULT 0,
-  friday_curfew_respected INTEGER NOT NULL DEFAULT 0
+  no_early_fills BOOLEAN NOT NULL DEFAULT false,
+  working_window_respected BOOLEAN NOT NULL DEFAULT false,
+  clipped_sizing BOOLEAN NOT NULL DEFAULT false,
+  blocked_strikes_verified BOOLEAN NOT NULL DEFAULT false,
+  fills_logged BOOLEAN NOT NULL DEFAULT false,
+  thursday_reserve_deployed BOOLEAN NOT NULL DEFAULT false,
+  friday_curfew_respected BOOLEAN NOT NULL DEFAULT false
+);
+CREATE TABLE IF NOT EXISTS journal_notes (
+  id SERIAL PRIMARY KEY,
+  date TEXT NOT NULL,
+  category TEXT NOT NULL DEFAULT 'general',
+  text TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 `);
+
+  // Additive migration: older databases predate the peak-tracking columns.
+  await pool.query(`
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'flies' AND column_name = 'peak_profit_pct'
+  ) THEN
+    ALTER TABLE flies ADD COLUMN peak_profit_pct REAL;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'flies' AND column_name = 'peak_loss_pct'
+  ) THEN
+    ALTER TABLE flies ADD COLUMN peak_loss_pct REAL;
+  END IF;
+END $$;
+`);
+}
 
 export interface IStorage {
   getUser(id: number): Promise<User | undefined>;
@@ -101,95 +139,126 @@ export interface IStorage {
 
   getChecklist(weekOf: string): Promise<ExecutionChecklist | undefined>;
   upsertChecklist(weekOf: string, patch: Partial<InsertExecutionChecklist>): Promise<ExecutionChecklist>;
+
+  // Ratchets the fly's peak profit / trough loss (as % of maxProfit / maxLoss) up/down only,
+  // never resets. No-op for closed flies — tracking is only meaningful while open.
+  trackFlyExtreme(id: number, profitPct: number, lossPct: number): Promise<Fly | undefined>;
+
+  listJournalNotes(): Promise<JournalNote[]>;
+  createJournalNote(note: InsertJournalNote): Promise<JournalNote>;
 }
 
 export class DatabaseStorage implements IStorage {
   async getUser(id: number): Promise<User | undefined> {
-    return db.select().from(users).where(eq(users.id, id)).get();
+    const rows = await db.select().from(users).where(eq(users.id, id));
+    return rows[0];
   }
 
   async getUserByUsername(username: string): Promise<User | undefined> {
-    return db.select().from(users).where(eq(users.username, username)).get();
+    const rows = await db.select().from(users).where(eq(users.username, username));
+    return rows[0];
   }
 
   async createUser(insertUser: InsertUser): Promise<User> {
-    return db.insert(users).values(insertUser).returning().get();
+    const rows = await db.insert(users).values(insertUser).returning();
+    return rows[0];
   }
 
   async listFlies(): Promise<Fly[]> {
-    return db.select().from(flies).orderBy(desc(flies.createdAt)).all();
+    return db.select().from(flies).orderBy(desc(flies.createdAt));
   }
 
   async getFly(id: number): Promise<Fly | undefined> {
-    return db.select().from(flies).where(eq(flies.id, id)).get();
+    const rows = await db.select().from(flies).where(eq(flies.id, id));
+    return rows[0];
   }
 
   async createFly(fly: InsertFly): Promise<Fly> {
-    return db
+    const rows = await db
       .insert(flies)
       .values({ ...fly, createdAt: new Date().toISOString() })
-      .returning()
-      .get();
+      .returning();
+    return rows[0];
   }
 
   async updateFly(id: number, fly: Partial<InsertFly>): Promise<Fly | undefined> {
-    return db.update(flies).set(fly).where(eq(flies.id, id)).returning().get();
+    const rows = await db.update(flies).set(fly).where(eq(flies.id, id)).returning();
+    return rows[0];
   }
 
   async deleteFly(id: number): Promise<void> {
-    db.delete(flies).where(eq(flies.id, id)).run();
+    await db.delete(flies).where(eq(flies.id, id));
+  }
+
+  async trackFlyExtreme(id: number, profitPct: number, lossPct: number): Promise<Fly | undefined> {
+    const fly = await this.getFly(id);
+    if (!fly || fly.status !== "open") return fly;
+    const nextPeakProfit = Math.max(fly.peakProfitPct ?? -Infinity, profitPct);
+    const nextPeakLoss = Math.min(fly.peakLossPct ?? Infinity, lossPct);
+    if (nextPeakProfit === fly.peakProfitPct && nextPeakLoss === fly.peakLossPct) return fly; // no new extreme
+    const rows = await db
+      .update(flies)
+      .set({ peakProfitPct: nextPeakProfit, peakLossPct: nextPeakLoss })
+      .where(eq(flies.id, id))
+      .returning();
+    return rows[0];
   }
 
   async listCampaignWalls(): Promise<CampaignWall[]> {
-    return db.select().from(campaignWalls).orderBy(desc(campaignWalls.createdAt)).all();
+    return db.select().from(campaignWalls).orderBy(desc(campaignWalls.createdAt));
   }
 
   async getCampaignWall(id: number): Promise<CampaignWall | undefined> {
-    return db.select().from(campaignWalls).where(eq(campaignWalls.id, id)).get();
+    const rows = await db.select().from(campaignWalls).where(eq(campaignWalls.id, id));
+    return rows[0];
   }
 
   async createCampaignWall(wall: InsertCampaignWall): Promise<CampaignWall> {
-    return db
+    const rows = await db
       .insert(campaignWalls)
       .values({ ...wall, createdAt: new Date().toISOString() })
-      .returning()
-      .get();
+      .returning();
+    return rows[0];
   }
 
   async updateCampaignWall(id: number, wall: Partial<InsertCampaignWall>): Promise<CampaignWall | undefined> {
-    return db.update(campaignWalls).set(wall).where(eq(campaignWalls.id, id)).returning().get();
+    const rows = await db.update(campaignWalls).set(wall).where(eq(campaignWalls.id, id)).returning();
+    return rows[0];
   }
 
   async deleteCampaignWall(id: number): Promise<void> {
-    db.delete(campaignWalls).where(eq(campaignWalls.id, id)).run();
+    await db.delete(campaignWalls).where(eq(campaignWalls.id, id));
   }
 
   async getSettings(): Promise<Settings> {
-    const existing = db.select().from(settings).where(eq(settings.id, 1)).get();
-    if (existing) return existing;
-    return db
+    const rows = await db.select().from(settings).where(eq(settings.id, 1));
+    if (rows[0]) return rows[0];
+    const inserted = await db
       .insert(settings)
       .values({ id: 1, accountBalance: 1000, riskPerTradePercent: 10, defaultSymbol: "QQQ" })
-      .returning()
-      .get();
+      .returning();
+    return inserted[0];
   }
 
   async updateSettings(s: Partial<InsertSettings>): Promise<Settings> {
     await this.getSettings();
-    return db.update(settings).set(s).where(eq(settings.id, 1)).returning().get();
+    const rows = await db.update(settings).set(s).where(eq(settings.id, 1)).returning();
+    return rows[0];
   }
 
   async getChecklist(weekOf: string): Promise<ExecutionChecklist | undefined> {
-    const row = db.select().from(executionChecklist).where(eq(executionChecklist.id, 1)).get();
+    const rows = await db.select().from(executionChecklist).where(eq(executionChecklist.id, 1));
+    const row = rows[0];
     if (row && row.weekOf === weekOf) return row;
     return undefined;
   }
 
   async upsertChecklist(weekOf: string, patch: Partial<InsertExecutionChecklist>): Promise<ExecutionChecklist> {
-    const row = db.select().from(executionChecklist).where(eq(executionChecklist.id, 1)).get();
+    const rows = await db.select().from(executionChecklist).where(eq(executionChecklist.id, 1));
+    const row = rows[0];
     if (!row || row.weekOf !== weekOf) {
-      db.delete(executionChecklist).where(eq(executionChecklist.id, 1)).run();
-      return db
+      await db.delete(executionChecklist).where(eq(executionChecklist.id, 1));
+      const inserted = await db
         .insert(executionChecklist)
         .values({
           id: 1,
@@ -203,10 +272,23 @@ export class DatabaseStorage implements IStorage {
           fridayCurfewRespected: false,
           ...patch,
         })
-        .returning()
-        .get();
+        .returning();
+      return inserted[0];
     }
-    return db.update(executionChecklist).set(patch).where(eq(executionChecklist.id, 1)).returning().get();
+    const updated = await db.update(executionChecklist).set(patch).where(eq(executionChecklist.id, 1)).returning();
+    return updated[0];
+  }
+
+  async listJournalNotes(): Promise<JournalNote[]> {
+    return db.select().from(journalNotes).orderBy(desc(journalNotes.createdAt));
+  }
+
+  async createJournalNote(note: InsertJournalNote): Promise<JournalNote> {
+    const rows = await db
+      .insert(journalNotes)
+      .values({ ...note, createdAt: new Date().toISOString() })
+      .returning();
+    return rows[0];
   }
 }
 

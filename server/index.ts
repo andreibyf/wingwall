@@ -4,6 +4,7 @@ import type { Request } from 'express';
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "node:http";
+import { ensureSchema } from "./storage";
 
 const app = express();
 const httpServer = createServer(app);
@@ -62,6 +63,11 @@ app.use((req, res, next) => {
 });
 
 (async () => {
+  // Bootstrap Postgres tables (CREATE TABLE IF NOT EXISTS + additive column migration)
+  // before accepting traffic. Must complete before registerRoutes/listen so the very
+  // first request never races an empty database.
+  await ensureSchema();
+
   await registerRoutes(httpServer, app);
 
   app.use((err: any, _req: Request, res: Response, next: NextFunction) => {

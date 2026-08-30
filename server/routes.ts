@@ -7,6 +7,7 @@ import {
   insertCampaignWallSchema,
   insertSettingsSchema,
   insertExecutionChecklistSchema,
+  insertJournalNoteSchema,
 } from "@shared/schema";
 import { computeFlyPricing, getMultiplier, type ChainLeg } from "@shared/flyMath";
 import { getIbkrFlyQuote, isIbkrSupported, IbkrPricingError } from "./ibkr";
@@ -106,6 +107,68 @@ async function getChain(symbol: string) {
   return result;
 }
 
+// Shared IBKR-first, Cboe-fallback pricing lookup for one fly's 3 legs. Used by both
+// the interactive /api/fly-price route and the server-side peak-tracking job below, so
+// tracked peaks always reflect the exact same pricing logic the UI displays.
+// In production (RENDER=true, no `external-tool` CLI / IBKR connector available), IBKR
+// is skipped entirely so every request goes straight to Cboe without wasted retries.
+const IBKR_AVAILABLE = process.env.RENDER !== "true" && process.env.DISABLE_IBKR !== "true";
+
+async function getFlyLivePricing(
+  symbol: string,
+  optionType: "call" | "put",
+  expiration: string,
+  lowerStrike: number,
+  middleStrike: number,
+  upperStrike: number,
+  contracts: number,
+) {
+  const legs = { optionType, lowerStrike, middleStrike, upperStrike, contracts } as const;
+  const multiplier = getMultiplier(symbol);
+
+  if (IBKR_AVAILABLE && isIbkrSupported(symbol)) {
+    try {
+      const quote = await getIbkrFlyQuote(symbol, expiration, optionType, lowerStrike, middleStrike, upperStrike);
+      const pricing = computeFlyPricing(legs, [quote.lowerLeg, quote.middleLeg, quote.upperLeg], multiplier);
+      return { source: "ibkr", multiplier, spot: quote.spot, timestamp: new Date().toISOString(), ...pricing };
+    } catch (err) {
+      if (!(err instanceof IbkrPricingError)) console.error("IBKR pricing error:", err);
+      // fall through to Cboe fallback below
+    }
+  }
+
+  if (SUPPORTED_SYMBOLS.has(symbol)) {
+    try {
+      const chain = await getChain(symbol);
+      const chainLegs: ChainLeg[] = chain.options.filter((o: any) => o.expiration === expiration);
+      const pricing = computeFlyPricing(legs, chainLegs, multiplier);
+      if (pricing.midDebit !== null) {
+        return { source: "cboe", multiplier, spot: chain.spot, timestamp: chain.timestamp, ...pricing };
+      }
+    } catch {
+      // fall through to unavailable below
+    }
+  }
+
+  return {
+    source: "unavailable",
+    multiplier,
+    spot: null,
+    timestamp: new Date().toISOString(),
+    midDebit: null,
+    worstDebit: null,
+    maxLossMid: null,
+    maxLossWorst: null,
+    maxProfit: null,
+    breakevenLower: null,
+    breakevenUpper: null,
+    rewardToRiskMid: null,
+    isBrokenWing: Math.abs((middleStrike - lowerStrike) - (upperStrike - middleStrike)) > 0.001,
+    lowerWingWidth: middleStrike - lowerStrike,
+    upperWingWidth: upperStrike - middleStrike,
+  };
+}
+
 export async function registerRoutes(
   httpServer: Server,
   app: Express
@@ -131,50 +194,57 @@ export async function registerRoutes(
         return res.status(400).json({ message: "expiration, lower, middle, upper are required" });
       }
 
-      const legs = { optionType, lowerStrike, middleStrike, upperStrike, contracts } as const;
-      const multiplier = getMultiplier(symbol);
+      const pricing = await getFlyLivePricing(symbol, optionType, expiration, lowerStrike, middleStrike, upperStrike, contracts);
+      res.json(pricing);
+    } catch (err) {
+      next(err);
+    }
+  });
 
-      if (isIbkrSupported(symbol)) {
-        try {
-          const quote = await getIbkrFlyQuote(symbol, expiration, optionType, lowerStrike, middleStrike, upperStrike);
-          const pricing = computeFlyPricing(legs, [quote.lowerLeg, quote.middleLeg, quote.upperLeg], multiplier);
-          return res.json({ source: "ibkr", multiplier, spot: quote.spot, timestamp: new Date().toISOString(), ...pricing });
-        } catch (err) {
-          if (!(err instanceof IbkrPricingError)) console.error("IBKR pricing error:", err);
-          // fall through to Cboe fallback below
-        }
+  // ---- Server-side peak tracking (for the Render cron job) ----
+  // Loops every open fly, prices it via the same IBKR/Cboe fallback logic as the UI,
+  // and ratchets peakProfitPct/peakLossPct. This is what makes threshold tracking run
+  // 24/7 instead of only while a browser tab has the dashboard open. Protected by a
+  // shared-secret header since it's a public write endpoint hit on a schedule.
+  app.post("/api/track-all-open-peaks", async (req, res, next) => {
+    try {
+      const secret = process.env.CRON_SECRET;
+      if (secret && req.header("x-cron-secret") !== secret) {
+        return res.status(401).json({ message: "unauthorized" });
       }
-
-      if (SUPPORTED_SYMBOLS.has(symbol)) {
+      const openFlies = (await storage.listFlies()).filter((f) => f.status === "open");
+      const results: any[] = [];
+      for (const fly of openFlies) {
         try {
-          const chain = await getChain(symbol);
-          const chainLegs: ChainLeg[] = chain.options.filter((o: any) => o.expiration === expiration);
-          const pricing = computeFlyPricing(legs, chainLegs, multiplier);
-          if (pricing.midDebit !== null) {
-            return res.json({ source: "cboe", multiplier, spot: chain.spot, timestamp: chain.timestamp, ...pricing });
+          const pricing = await getFlyLivePricing(
+            fly.symbol,
+            fly.optionType as "call" | "put",
+            fly.expiration,
+            fly.lowerStrike,
+            fly.middleStrike,
+            fly.upperStrike,
+            fly.contracts,
+          );
+          if (pricing.midDebit === null || pricing.midDebit === undefined) {
+            results.push({ id: fly.id, skipped: true, reason: pricing.source });
+            continue;
           }
-        } catch {
-          // fall through to unavailable below
+          const multiplier = getMultiplier(fly.symbol);
+          const pnl = (pricing.midDebit - fly.entryDebit) * multiplier * fly.contracts;
+          const profitPct = pnl / fly.maxProfit;
+          const lossPct = pnl / fly.maxLoss;
+          const updated = await storage.trackFlyExtreme(fly.id, profitPct, lossPct);
+          results.push({
+            id: fly.id,
+            source: pricing.source,
+            peakProfitPct: updated?.peakProfitPct,
+            peakLossPct: updated?.peakLossPct,
+          });
+        } catch (err) {
+          results.push({ id: fly.id, error: err instanceof Error ? err.message : String(err) });
         }
       }
-
-      return res.json({
-        source: "unavailable",
-        multiplier,
-        spot: null,
-        timestamp: new Date().toISOString(),
-        midDebit: null,
-        worstDebit: null,
-        maxLossMid: null,
-        maxLossWorst: null,
-        maxProfit: null,
-        breakevenLower: null,
-        breakevenUpper: null,
-        rewardToRiskMid: null,
-        isBrokenWing: Math.abs((middleStrike - lowerStrike) - (upperStrike - middleStrike)) > 0.001,
-        lowerWingWidth: middleStrike - lowerStrike,
-        upperWingWidth: upperStrike - middleStrike,
-      });
+      res.json({ checked: openFlies.length, results });
     } catch (err) {
       next(err);
     }
@@ -252,6 +322,25 @@ export async function registerRoutes(
     }
   });
 
+  // Called by the client whenever it computes a fresh unrealized P&L for an OPEN fly.
+  // Ratchets peakProfitPct up / peakLossPct down; no-op once the fly is closed.
+  // profitPct/lossPct are fractions of maxProfit/maxLoss respectively (e.g. 0.25 = 25%).
+  app.post("/api/flies/:id/track-extreme", async (req, res, next) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      const profitPct = Number(req.body?.profitPct);
+      const lossPct = Number(req.body?.lossPct);
+      if (Number.isNaN(profitPct) || Number.isNaN(lossPct)) {
+        return res.status(400).json({ message: "profitPct and lossPct (numbers) are required" });
+      }
+      const updated = await storage.trackFlyExtreme(id, profitPct, lossPct);
+      if (!updated) return res.status(404).json({ message: "Fly not found" });
+      res.json(updated);
+    } catch (err) {
+      next(err);
+    }
+  });
+
   // ---- Campaign walls ----
   app.get("/api/campaign", async (_req, res, next) => {
     try {
@@ -324,6 +413,24 @@ export async function registerRoutes(
     try {
       const parsed = insertSettingsSchema.partial().parse(req.body);
       res.json(await storage.updateSettings(parsed));
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ---- Journal notes (freeform desk log, e.g. tuning-experiment entries) ----
+  app.get("/api/journal-notes", async (_req, res, next) => {
+    try {
+      res.json(await storage.listJournalNotes());
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post("/api/journal-notes", async (req, res, next) => {
+    try {
+      const parsed = insertJournalNoteSchema.parse(req.body);
+      res.status(201).json(await storage.createJournalNote(parsed));
     } catch (err) {
       next(err);
     }

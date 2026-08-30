@@ -1,7 +1,25 @@
 import { useMemo, useState } from "react";
-import { useFlies, useUpdateFly, useDeleteFly, useSettings, useUpdateSettings, useChain, useFlyPrice } from "@/lib/hooks";
+import {
+  useFlies,
+  useUpdateFly,
+  useDeleteFly,
+  useSettings,
+  useUpdateSettings,
+  useChain,
+  useFlyPrice,
+  useJournalNotes,
+  useCreateJournalNote,
+} from "@/lib/hooks";
 import { computeFlyPricing, computeJournalStats, rMultiple, getMultiplier } from "@/lib/flyMath";
 import { fmtUsd, fmtPct, fmtR, todayIso } from "@/lib/format";
+import {
+  TAKE_PROFIT_PCT,
+  STOP_LOSS_PCT,
+  GAMMA_WARNING_DTE,
+  WING_BREACH_URGENT_DTE,
+  CAPITAL_WARN_PCT,
+  CAPITAL_DANGER_PCT,
+} from "@shared/thresholds";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -22,10 +40,34 @@ export default function Journal() {
   const { data: flies, isLoading } = useFlies();
   const { data: settings } = useSettings();
   const updateSettings = useUpdateSettings();
+  const { data: journalNotes } = useJournalNotes();
+  const createJournalNote = useCreateJournalNote();
+  const { toast } = useToast();
 
   const openFlies = useMemo(() => (flies ?? []).filter((f) => f.status === "open"), [flies]);
   const closedFlies = useMemo(() => (flies ?? []).filter((f) => f.status === "closed"), [flies]);
   const stats = useMemo(() => computeJournalStats(closedFlies), [closedFlies]);
+
+  const handleLogTuningExperiment = async () => {
+    const regime = [
+      `take_profit=${fmtPct(TAKE_PROFIT_PCT)}`,
+      `stop_loss=${fmtPct(STOP_LOSS_PCT)}`,
+      `gamma_warning_dte=${GAMMA_WARNING_DTE}`,
+      `wing_breach_urgent_dte=${WING_BREACH_URGENT_DTE}`,
+      `capital_warn=${fmtPct(CAPITAL_WARN_PCT)}`,
+      `capital_danger=${fmtPct(CAPITAL_DANGER_PCT)}`,
+    ].join(", ");
+    try {
+      await createJournalNote.mutateAsync({
+        date: todayIso(),
+        category: "tuning-experiment",
+        text: `Cockpit threshold regime as of today: ${regime}. Logged so future closed trades can be matched to the settings that were active when they were open.`,
+      });
+      toast({ title: "Tuning experiment logged" });
+    } catch (e: any) {
+      toast({ title: "Failed to log experiment", description: e.message, variant: "destructive" });
+    }
+  };
 
   return (
     <div className="flex flex-col gap-6">
@@ -63,12 +105,57 @@ export default function Journal() {
         )}
       </div>
 
+      <div className="rounded-lg border border-card-border bg-card">
+        <div className="border-b border-card-border px-4 py-3">
+          <h2 className="text-sm font-semibold">Threshold review</h2>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            For each closed trade: the peak % of max profit / max loss reached while it was open, whether the
+            current take-profit ({fmtPct(TAKE_PROFIT_PCT)}) or stop-loss ({fmtPct(STOP_LOSS_PCT)}) signal ever
+            fired, and a discipline read on the exit. Peaks only capture while a browser tab had this dashboard
+            open — there's no background job, so this is a lower bound on the true intraday extreme, not a
+            guarantee.
+          </p>
+        </div>
+        <ThresholdReview flies={closedFlies} />
+      </div>
+
+      <div className="rounded-lg border border-card-border bg-card p-4">
+        <div className="mb-3 flex items-center justify-between">
+          <div>
+            <h2 className="text-sm font-semibold">Tuning log</h2>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              A running desk log of threshold changes and experiment notes, so later you can tell which
+              regime was active when a given trade was open.
+            </p>
+          </div>
+          <Button size="sm" variant="outline" onClick={handleLogTuningExperiment} data-testid="button-log-tuning-experiment">
+            Log current regime
+          </Button>
+        </div>
+        {!journalNotes || journalNotes.length === 0 ? (
+          <div className="text-sm text-muted-foreground">No log entries yet.</div>
+        ) : (
+          <ul className="flex flex-col gap-2">
+            {journalNotes.map((n) => (
+              <li key={n.id} className="rounded-md border border-card-border/60 p-2.5 text-xs">
+                <div className="mb-1 flex items-center gap-2 text-muted-foreground">
+                  <span className="font-mono">{n.date}</span>
+                  <Badge variant="outline" className="text-[10px] capitalize">{n.category.replace("-", " ")}</Badge>
+                </div>
+                <div>{n.text}</div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
       <div className="rounded-lg border border-card-border bg-card p-4">
         <h2 className="mb-3 text-sm font-semibold">Settings</h2>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
           <div className="flex flex-col gap-1.5">
             <Label className="text-xs">Account balance</Label>
             <Input
+              key={`balance-${settings?.accountBalance ?? "loading"}`}
               data-testid="input-account-balance"
               type="number"
               defaultValue={settings?.accountBalance ?? 1000}
@@ -78,6 +165,7 @@ export default function Journal() {
           <div className="flex flex-col gap-1.5">
             <Label className="text-xs">Risk per trade (%)</Label>
             <Input
+              key={`risk-${settings?.riskPerTradePercent ?? "loading"}`}
               data-testid="input-risk-per-trade"
               type="number"
               defaultValue={settings?.riskPerTradePercent ?? 10}
@@ -114,6 +202,98 @@ function StatChip({ label, value, tone }: { label: string; value: string; tone?:
         {value}
       </div>
     </div>
+  );
+}
+
+// Peak-tracking / discipline review against the CURRENT threshold regime. This is a
+// heuristic first pass with zero real closed trades to validate against yet — the
+// tolerance bands below (e.g. "near" take-profit) are judgment calls, not derived from
+// data. Revisit once there's a real sample of closed trades.
+const NEAR_SIGNAL_TOLERANCE = 0.9; // "exited near the signal" = within 90% of the threshold's own magnitude
+
+type Verdict = { label: string; tone: "good" | "warn" | "neutral" };
+
+function computeVerdict(fly: Fly): Verdict {
+  const multiplier = getMultiplier(fly.symbol);
+  const pnl = ((fly.exitDebit ?? 0) - fly.entryDebit) * multiplier * fly.contracts;
+  const finalProfitPct = fly.maxProfit > 0 ? pnl / fly.maxProfit : 0;
+  const finalLossPct = fly.maxLoss > 0 ? pnl / fly.maxLoss : 0;
+
+  const hasPeakData = fly.peakProfitPct != null || fly.peakLossPct != null;
+  if (!hasPeakData) {
+    return { label: "No peak data — opened before tracking began", tone: "neutral" };
+  }
+
+  const tpFired = (fly.peakProfitPct ?? -Infinity) >= TAKE_PROFIT_PCT;
+  const slFired = (fly.peakLossPct ?? Infinity) <= STOP_LOSS_PCT;
+
+  if (tpFired && pnl >= 0) {
+    return finalProfitPct >= TAKE_PROFIT_PCT * NEAR_SIGNAL_TOLERANCE
+      ? { label: "Exited at/above take-profit signal — good discipline", tone: "good" }
+      : { label: "Take-profit signal fired, but exited after profit decayed — missed exit", tone: "warn" };
+  }
+  if (slFired) {
+    return finalLossPct <= STOP_LOSS_PCT
+      ? { label: "Stop-loss signal fired — held past it before exiting", tone: "warn" }
+      : { label: "Stop-loss signal fired — exited before it worsened further", tone: "good" };
+  }
+  return { label: "Neither threshold crossed — closed within normal range", tone: "neutral" };
+}
+
+function ThresholdReview({ flies }: { flies: Fly[] }) {
+  if (flies.length === 0) {
+    return (
+      <div className="p-4 text-sm text-muted-foreground">
+        No closed trades yet — this fills in as positions close. Give it a handful of closes
+        (roughly 8-10 for an early read, 15-20+ before the pattern is reliable) before drawing
+        conclusions about the {fmtPct(TAKE_PROFIT_PCT)}/{fmtPct(STOP_LOSS_PCT)} regime.
+      </div>
+    );
+  }
+  return (
+    <div className="max-h-96 overflow-y-auto [overscroll-behavior:contain]">
+      <table className="w-full text-xs">
+        <thead className="sticky top-0 z-[1] bg-card">
+          <tr className="border-b border-card-border text-muted-foreground">
+            <th className="px-3 py-2 text-left font-medium">Position</th>
+            <th className="px-3 py-2 text-right font-medium">Peak % of max profit</th>
+            <th className="px-3 py-2 text-right font-medium">Peak % of max loss</th>
+            <th className="px-3 py-2 text-right font-medium">Realized outcome</th>
+            <th className="px-3 py-2 text-left font-medium">Verdict</th>
+          </tr>
+        </thead>
+        <tbody className="font-mono tabular-nums">
+          {flies.map((f) => (
+            <ThresholdRow key={f.id} fly={f} />
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ThresholdRow({ fly }: { fly: Fly }) {
+  const multiplier = getMultiplier(fly.symbol);
+  const pnl = ((fly.exitDebit ?? 0) - fly.entryDebit) * multiplier * fly.contracts;
+  const finalPct = pnl >= 0
+    ? (fly.maxProfit > 0 ? pnl / fly.maxProfit : 0)
+    : (fly.maxLoss > 0 ? pnl / fly.maxLoss : 0);
+  const verdict = computeVerdict(fly);
+  const toneClass =
+    verdict.tone === "good" ? "text-chart-4" : verdict.tone === "warn" ? "text-amber-400" : "text-muted-foreground";
+
+  return (
+    <tr className="border-b border-card-border/60 last:border-0">
+      <td className="px-3 py-1.5 text-left">
+        {fly.symbol} {fly.optionType} {fly.lowerStrike}/{fly.middleStrike}/{fly.upperStrike}
+      </td>
+      <td className="px-3 py-1.5 text-right">{fly.peakProfitPct != null ? fmtPct(fly.peakProfitPct) : "—"}</td>
+      <td className="px-3 py-1.5 text-right">{fly.peakLossPct != null ? fmtPct(fly.peakLossPct) : "—"}</td>
+      <td className={`px-3 py-1.5 text-right ${pnl >= 0 ? "text-chart-4" : "text-destructive"}`}>
+        {fmtUsd(pnl, { signed: true })} ({fmtPct(finalPct)})
+      </td>
+      <td className={`px-3 py-1.5 text-left font-sans ${toneClass}`}>{verdict.label}</td>
+    </tr>
   );
 }
 

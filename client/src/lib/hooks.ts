@@ -1,6 +1,17 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiRequest } from "./queryClient";
-import type { Fly, InsertFly, CampaignWall, InsertCampaignWall, Settings, InsertSettings, ExecutionChecklist, InsertExecutionChecklist } from "@shared/schema";
+import type {
+  Fly,
+  InsertFly,
+  CampaignWall,
+  InsertCampaignWall,
+  Settings,
+  InsertSettings,
+  ExecutionChecklist,
+  InsertExecutionChecklist,
+  JournalNote,
+  InsertJournalNote,
+} from "@shared/schema";
 
 export type ChainOption = {
   symbol: string;
@@ -108,6 +119,39 @@ export function useFlies() {
   return useQuery<Fly[]>({ queryKey: ["/api/flies"] });
 }
 
+// Live-first pricing for a whole list of flies at once (used by the Cockpit dials/meters).
+// Wraps useQueries so the hook count stays stable regardless of how many positions are open.
+export function useFliesLivePricing(flies: Fly[]) {
+  return useQueries({
+    queries: flies.map((f) => {
+      const search = new URLSearchParams({
+        optionType: f.optionType,
+        expiration: f.expiration,
+        lower: String(f.lowerStrike),
+        middle: String(f.middleStrike),
+        upper: String(f.upperStrike),
+        contracts: String(f.contracts),
+      }).toString();
+      const url = `/api/fly-price/${f.symbol}?${search}`;
+      return {
+        queryKey: [url],
+        refetchInterval: 10_000 as const,
+        staleTime: 5_000,
+      };
+    }),
+  });
+}
+
+// Live spot quotes for a set of symbols (used to gauge distance-to-wall per position).
+export function useQuotesFor(symbols: string[]) {
+  return useQueries({
+    queries: symbols.map((s) => ({
+      queryKey: [`/api/quote/${s}`],
+      refetchInterval: 15_000 as const,
+    })),
+  });
+}
+
 export function useCreateFly() {
   const qc = useQueryClient();
   return useMutation({
@@ -135,6 +179,21 @@ export function useDeleteFly() {
   return useMutation({
     mutationFn: async (id: number) => {
       await apiRequest("DELETE", `/api/flies/${id}`);
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["/api/flies"] }),
+  });
+}
+
+// Reports a freshly-computed unrealized P&L extreme for an OPEN fly (as a fraction of
+// maxProfit / maxLoss). The server only ratchets peakProfitPct up / peakLossPct down—
+// safe to call repeatedly with the same or a worse value. Invalidates the flies list so
+// the Journal's threshold-review panel reflects the latest peak without a manual refresh.
+export function useTrackFlyExtreme() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id, profitPct, lossPct }: { id: number; profitPct: number; lossPct: number }) => {
+      const res = await apiRequest("POST", `/api/flies/${id}/track-extreme`, { profitPct, lossPct });
+      return (await res.json()) as Fly;
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["/api/flies"] }),
   });
@@ -206,5 +265,21 @@ export function useUpdateChecklist(weekOf: string) {
       return (await res.json()) as ExecutionChecklist;
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: [`/api/checklist/${weekOf}`] }),
+  });
+}
+
+// ---- Journal notes (freeform desk log) ----
+export function useJournalNotes() {
+  return useQuery<JournalNote[]>({ queryKey: ["/api/journal-notes"] });
+}
+
+export function useCreateJournalNote() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (note: InsertJournalNote) => {
+      const res = await apiRequest("POST", "/api/journal-notes", note);
+      return (await res.json()) as JournalNote;
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["/api/journal-notes"] }),
   });
 }
