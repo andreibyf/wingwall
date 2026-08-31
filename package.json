@@ -76,11 +76,20 @@
     "wouter": "^3.3.5",
     "ws": "^8.18.0",
     "zod": "^4.4.3",
-    "zod-validation-error": "^5.0.0"
-  },
-  "devDependencies": {
+    "zod-validation-error": "^5.0.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.20.5",
+    "typescript": "5.6.3",
+    "drizzle-kit": "^0.31.8",
     "@tailwindcss/typography": "^0.5.20",
     "@tailwindcss/vite": "^4.1.18",
+    "@vitejs/plugin-react": "^4.7.0",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.47",
+    "tailwindcss": "^3.4.17",
+    "vite": "^7.3.0"
+  },
+  "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/express": "^5.0.0",
     "@types/express-session": "^1.18.0",
@@ -89,16 +98,7 @@
     "@types/passport-local": "^1.0.38",
     "@types/react": "^18.3.11",
     "@types/react-dom": "^18.3.1",
-    "@types/ws": "^8.5.13",
-    "@vitejs/plugin-react": "^4.7.0",
-    "autoprefixer": "^10.4.20",
-    "drizzle-kit": "^0.31.8",
-    "esbuild": "^0.25.0",
-    "postcss": "^8.4.47",
-    "tailwindcss": "^3.4.17",
-    "tsx": "^4.20.5",
-    "typescript": "5.6.3",
-    "vite": "^7.3.0"
+    "@types/ws": "^8.5.13"
   },
   "optionalDependencies": {
     "bufferutil": "^4.0.8"
