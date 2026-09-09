@@ -140,6 +140,50 @@ export function deriveFlyEconomics(
   return { maxLoss, maxProfit, breakevenLower, breakevenUpper, rewardToRisk, isBrokenWing };
 }
 
+export type PayoffPoint = { price: number; pnl: number };
+
+// Theoretical P&L at expiration across a range of underlying prices for a debit
+// butterfly (or broken-wing butterfly). Pure intrinsic-value math -- no Black-Scholes
+// or time value involved, since expiration payoff only depends on where the
+// underlying settles relative to the three strikes.
+export function buildPayoffCurve(
+  optionType: "call" | "put",
+  lowerStrike: number,
+  middleStrike: number,
+  upperStrike: number,
+  contracts: number,
+  debit: number,
+  multiplier = 100,
+  opts?: { spot?: number | null; points?: number }
+): PayoffPoint[] {
+  const totalWidth = upperStrike - lowerStrike;
+  const pad = Math.max(totalWidth * 0.5, 1);
+  let rangeLow = lowerStrike - pad;
+  let rangeHigh = upperStrike + pad;
+  if (opts?.spot != null && Number.isFinite(opts.spot)) {
+    rangeLow = Math.min(rangeLow, opts.spot - pad * 0.3);
+    rangeHigh = Math.max(rangeHigh, opts.spot + pad * 0.3);
+  }
+
+  const intrinsicAt = (price: number) =>
+    optionType === "call"
+      ? Math.max(price - lowerStrike, 0) - 2 * Math.max(price - middleStrike, 0) + Math.max(price - upperStrike, 0)
+      : Math.max(lowerStrike - price, 0) - 2 * Math.max(middleStrike - price, 0) + Math.max(upperStrike - price, 0);
+
+  const pnlAt = (price: number) => Number(((intrinsicAt(price) - debit) * multiplier * contracts).toFixed(2));
+
+  const count = opts?.points ?? 60;
+  const step = (rangeHigh - rangeLow) / count;
+  const prices = new Set<number>();
+  for (let i = 0; i <= count; i++) prices.add(Number((rangeLow + step * i).toFixed(2)));
+  // Ensure the kink points (wings + body) land exactly on the curve for a crisp peak/floor.
+  [lowerStrike, middleStrike, upperStrike].forEach((s) => prices.add(Number(s.toFixed(2))));
+
+  return Array.from(prices)
+    .sort((a, b) => a - b)
+    .map((price) => ({ price, pnl: pnlAt(price) }));
+}
+
 // R-multiple: realized P&L divided by basis (entry debit paid, i.e. max loss).
 export function rMultiple(realizedPnl: number, basis: number): number | null {
   if (!basis || basis <= 0) return null;

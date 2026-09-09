@@ -1,7 +1,8 @@
 import { useMemo, useState } from "react";
 import { useChain, useFlies, useCreateFly, useFlyPrice } from "@/lib/hooks";
-import { computeFlyPricing, deriveFlyEconomics, getMultiplier } from "@/lib/flyMath";
+import { computeFlyPricing, deriveFlyEconomics, getMultiplier, buildPayoffCurve } from "@/lib/flyMath";
 import { fmtUsd, fmtNum, todayIso } from "@/lib/format";
+import { PayoffChart } from "@/components/app/PayoffChart";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -97,6 +98,26 @@ export default function Builder() {
     !isLive && legsComplete && !Number.isNaN(parsedManualDebit)
       ? deriveFlyEconomics(legs.lowerStrike, legs.middleStrike, legs.upperStrike, legs.contracts, parsedManualDebit, multiplier)
       : null;
+
+  // Theoretical payoff-at-expiration curve for whichever debit is currently in play
+  // (live mid debit, or the manually entered one for MES). Pure intrinsic-value math --
+  // see shared/flyMath.buildPayoffCurve -- so it stays accurate even without a live feed.
+  const activeDebit = isLive ? pricing?.midDebit ?? null : Number.isNaN(parsedManualDebit) ? null : parsedManualDebit;
+  const payoffCurve = useMemo(() => {
+    if (!legsComplete || activeDebit === null) return [];
+    return buildPayoffCurve(
+      optionType,
+      legs.lowerStrike,
+      legs.middleStrike,
+      legs.upperStrike,
+      legs.contracts,
+      activeDebit,
+      multiplier,
+      { spot: isLive ? chain?.spot ?? null : null }
+    );
+  }, [legsComplete, activeDebit, optionType, legs.lowerStrike, legs.middleStrike, legs.upperStrike, legs.contracts, multiplier, isLive, chain?.spot]);
+  const activeBreakevenLower = isLive ? pricing?.breakevenLower ?? null : manualPricing?.breakevenLower ?? null;
+  const activeBreakevenUpper = isLive ? pricing?.breakevenUpper ?? null : manualPricing?.breakevenUpper ?? null;
 
   // Blocked strikes: strikes already committed by open positions in this symbol+expiration.
   const effectiveExpiration = isLive ? activeExpiration : manualExpiration;
@@ -362,7 +383,19 @@ export default function Builder() {
                 <Metric label="Reward:risk" value={pricing.rewardToRiskMid !== null ? `${pricing.rewardToRiskMid.toFixed(2)}:1` : "—"} />
                 <Metric label="Structure" value={pricing.isBrokenWing ? "Broken-wing" : "Symmetric"} />
               </div>
-            ) : !isLive && !manualPricing ? (
+            ) : null}
+            {payoffCurve.length > 0 && (
+              <div className="mt-4 border-t border-card-border pt-3">
+                <div className="mb-2 text-xs font-medium text-muted-foreground">Payoff at expiration</div>
+                <PayoffChart
+                  curve={payoffCurve}
+                  spot={isLive ? chain?.spot ?? null : null}
+                  breakevenLower={activeBreakevenLower}
+                  breakevenUpper={activeBreakevenUpper}
+                />
+              </div>
+            )}
+            {!isLive && legsComplete && !manualPricing ? (
               <p className="text-sm text-muted-foreground">Enter a manual entry debit above to compute economics.</p>
             ) : !isLive && manualPricing ? (
               <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
