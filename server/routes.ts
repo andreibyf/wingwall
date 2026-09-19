@@ -11,6 +11,14 @@ import {
 } from "@shared/schema";
 import { computeFlyPricing, getMultiplier, type ChainLeg } from "@shared/flyMath";
 import { getIbkrFlyQuote, isIbkrSupported, IbkrPricingError } from "./ibkr";
+import {
+  buildSignalSnapshot,
+  runCopilotChat,
+  isCopilotConfigured,
+  listCopilotModels,
+  copilotModel,
+  type ChatMessage,
+} from "./copilot";
 
 const CBOE_BASE = "https://cdn.cboe.com/api/global/delayed_quotes/options";
 const SUPPORTED_SYMBOLS = new Set(["QQQ", "SPY"]);
@@ -431,6 +439,60 @@ export async function registerRoutes(
     try {
       const parsed = insertJournalNoteSchema.parse(req.body);
       res.status(201).json(await storage.createJournalNote(parsed));
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ---- Trading copilot (advice-only chat widget) ----
+  // Reports whether an ANTHROPIC_API_KEY is present so the widget can render a setup
+  // message instead of a dead chat box.
+  app.get("/api/copilot/status", (_req, res) => {
+    res.json({ configured: isCopilotConfigured(), model: copilotModel });
+  });
+
+  // Diagnostic: which model ids the configured key can actually reach. Used to confirm
+  // COPILOT_MODEL points at something real without redeploying to find out.
+  app.get("/api/copilot/models", async (_req, res, next) => {
+    try {
+      res.json({ models: await listCopilotModels(), configured: copilotModel });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // The snapshot the copilot sees, exposed on its own so the context can be inspected
+  // (and debugged) independently of a model call.
+  app.get("/api/copilot/context", async (_req, res, next) => {
+    try {
+      res.json(await buildSignalSnapshot(getFlyLivePricing));
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post("/api/copilot/chat", async (req, res, next) => {
+    try {
+      if (!isCopilotConfigured()) {
+        return res.status(503).json({
+          message:
+            "Copilot is not configured. Set ANTHROPIC_API_KEY in the service environment to enable it.",
+        });
+      }
+      const raw = Array.isArray(req.body?.messages) ? req.body.messages : null;
+      if (!raw) return res.status(400).json({ message: "messages[] is required" });
+
+      const messages: ChatMessage[] = raw
+        .filter((m: any) => (m?.role === "user" || m?.role === "assistant") && typeof m.content === "string")
+        .map((m: any) => ({ role: m.role, content: String(m.content).slice(0, 8000) }));
+
+      if (messages.length === 0) {
+        return res.status(400).json({ message: "No valid messages provided" });
+      }
+
+      const snapshot = await buildSignalSnapshot(getFlyLivePricing);
+      const result = await runCopilotChat(messages, snapshot);
+      res.json(result);
     } catch (err) {
       next(err);
     }

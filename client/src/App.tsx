@@ -12,6 +12,7 @@ import Journal from "@/pages/Journal";
 import Cockpit from "@/pages/Cockpit";
 import { Shell } from "@/components/app/Shell";
 import { ExtremeTracker } from "@/components/app/ExtremeTracker";
+import { CopilotWidget } from "@/components/app/CopilotWidget";
 
 function AppRouter() {
   return (
@@ -37,6 +38,8 @@ function App() {
         <ExtremeTracker />
         <Router hook={useHashLocation}>
           <AppRouter />
+          {/* Floating chat, available on every tab rather than living on its own route. */}
+          <CopilotWidget />
         </Router>
       </TooltipProvider>
     </QueryClientProvider>
