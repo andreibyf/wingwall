@@ -82,6 +82,36 @@ export const settings = pgTable("settings", {
   accountBalance: real("account_balance").notNull().default(1000),
   riskPerTradePercent: real("risk_per_trade_percent").notNull().default(10),
   defaultSymbol: text("default_symbol").notNull().default("QQQ"),
+
+  // --- Exit policy -----------------------------------------------------------
+  // Previously hardcoded in shared/thresholds.ts AND duplicated independently in
+  // server/copilot.ts, then restated in prose in the copilot prompt and again in the
+  // threshold-watch job. Four copies of one rule; changing it meant four edits and any
+  // miss left the system disagreeing with itself about when to exit. The database is now
+  // the single source of truth and every consumer reads from here.
+  //
+  // takeProfitMode exists because "percent of max profit" is unreachable on a cheap
+  // far-body fly. On the first three trades it demanded 4.2x, 5.0x and 5.4x the entry
+  // debit while the best excursion ever recorded was 9.4% of max profit against a 25%
+  // trigger -- the stop could fire but the target could not, so the automation could only
+  // ever cut losers. Both winning exits landed at 2.17x and 2.09x the debit, so a debit
+  // multiple describes the operator's actual behaviour.
+  takeProfitMode: text("take_profit_mode").notNull().default("multipleOfDebit"), // multipleOfDebit | pctOfMaxProfit
+  takeProfitValue: real("take_profit_value").notNull().default(2.0), // 2.0 = exit at 2x entry debit (+1.0R)
+  stopLossPctOfMaxLoss: real("stop_loss_pct_of_max_loss").notNull().default(-0.4),
+
+  // --- Structure targeting ---------------------------------------------------
+  // The playbook contradicts itself here: "debit kept at roughly half the wing width
+  // (~2:1 reward:risk floor)" cannot hold, since half the width is 1:1 and 2:1 needs a
+  // third. The first three trades used 0.054, 0.058 and 0.072 of the width -- neither
+  // documented rule. Made configurable rather than resolved by guesswork, defaulting to
+  // the operator's revealed preference for the cheap convex fly.
+  targetDebitToWidth: real("target_debit_to_width").notNull().default(0.06),
+  maxDebitToWidth: real("max_debit_to_width").notNull().default(0.15), // reject anything richer
+
+  // --- Autonomous trading ----------------------------------------------------
+  // Off by default. Nothing enters the book unattended until explicitly switched on.
+  autoTradeEnabled: boolean("auto_trade_enabled").notNull().default(false),
 });
 
 export const insertSettingsSchema = createInsertSchema(settings).omit({
