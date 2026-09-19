@@ -12,6 +12,7 @@ import {
 import { computeFlyPricing, getMultiplier, type ChainLeg } from "@shared/flyMath";
 import { z } from "zod";
 import { runAutoTrade, tradingWeek } from "./auto-trade";
+import { resolveExitPolicy, assessThresholdReachability } from "@shared/exit-policy";
 import { getIbkrFlyQuote, isIbkrSupported, IbkrPricingError } from "./ibkr";
 import {
   buildSignalSnapshot,
@@ -485,6 +486,137 @@ export async function registerRoutes(
       }
       settingsBoundsSchema.parse(merged);
       res.json(await storage.updateSettings(typed));
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ---- Exit check ----
+  // The scheduled exit watch used to restate the threshold arithmetic in its own prompt
+  // prose, which meant the rule existed in two places that could disagree -- and did: the
+  // prompt still said 25% of max profit after the policy moved to a debit multiple. This
+  // endpoint is now the single evaluator. The scheduled job reads `fires` and acts; it
+  // performs no arithmetic of its own and cannot apply a policy the app is not configured
+  // for.
+  app.get("/api/exit-check", async (_req, res, next) => {
+    try {
+      const [settings, allFlies] = await Promise.all([storage.getSettings(), storage.listFlies()]);
+      const policy = resolveExitPolicy({
+        takeProfitMode: settings?.takeProfitMode ?? "multipleOfDebit",
+        takeProfitValue: settings?.takeProfitValue ?? 2.0,
+        stopLossPctOfMaxLoss: settings?.stopLossPctOfMaxLoss ?? -0.4,
+      });
+      const open = allFlies.filter((f) => f.status === "open");
+
+      const today = new Date().toISOString().slice(0, 10);
+      const positions = await Promise.all(
+        open.map(async (fly) => {
+          const dte = Math.round(
+            (new Date(`${fly.expiration}T00:00:00Z`).getTime() - new Date(`${today}T00:00:00Z`).getTime()) /
+              86_400_000,
+          );
+          let pricing: any = null;
+          let pricingError: string | null = null;
+          try {
+            pricing = await getFlyLivePricing(
+              fly.symbol,
+              fly.optionType as "call" | "put",
+              fly.expiration,
+              fly.lowerStrike,
+              fly.middleStrike,
+              fly.upperStrike,
+              fly.contracts,
+            );
+          } catch (err) {
+            pricingError = (err as Error).message;
+          }
+
+          const mid = pricing?.midDebit;
+          if (mid === null || mid === undefined) {
+            return {
+              id: fly.id,
+              symbol: fly.symbol,
+              optionType: fly.optionType,
+              strikes: `${fly.lowerStrike}/${fly.middleStrike}/${fly.upperStrike}`,
+              expiration: fly.expiration,
+              contracts: fly.contracts,
+              entryDebit: fly.entryDebit,
+              dte,
+              priced: false,
+              reason: pricingError ?? pricing?.source ?? "no quote available",
+              // Explicit so an unpriceable position can never be read as "no exit needed".
+              fires: null,
+            };
+          }
+
+          const multiplier = getMultiplier(fly.symbol);
+          const pnl = (mid - fly.entryDebit) * multiplier * fly.contracts;
+          const profitPct = fly.maxProfit ? pnl / fly.maxProfit : 0;
+          const lossPct = fly.maxLoss ? pnl / fly.maxLoss : 0;
+          const takeProfitFires =
+            policy.takeProfitMode === "multipleOfDebit"
+              ? fly.entryDebit > 0 && mid >= fly.entryDebit * policy.takeProfitValue
+              : profitPct >= policy.takeProfitValue;
+          const stopLossFires = lossPct <= policy.stopLossPctOfMaxLoss;
+
+          return {
+            id: fly.id,
+            symbol: fly.symbol,
+            optionType: fly.optionType,
+            strikes: `${fly.lowerStrike}/${fly.middleStrike}/${fly.upperStrike}`,
+            expiration: fly.expiration,
+            contracts: fly.contracts,
+            entryDebit: fly.entryDebit,
+            dte,
+            priced: true,
+            source: pricing.source,
+            spot: pricing.spot,
+            midDebit: Math.round(mid * 100) / 100,
+            unrealizedPnl: Math.round(pnl * 100) / 100,
+            profitPctOfMaxProfit: Math.round(profitPct * 10000) / 10000,
+            lossPctOfMaxLoss: Math.round(lossPct * 10000) / 10000,
+            takeProfitFires,
+            stopLossFires,
+            reachability: assessThresholdReachability(
+              policy,
+              fly.entryDebit,
+              fly.maxProfit,
+              fly.maxLoss,
+              fly.contracts,
+              multiplier,
+              fly.peakProfitPct,
+            ),
+            // Informational only. The watch flags these; it does not close on them.
+            gammaWarning: dte <= 3,
+            wingBreachUrgent: dte <= 2,
+            // The single field the scheduled job branches on, plus the sentence it should
+            // journal if it acts. Both computed here so the job never does the arithmetic.
+            fires: takeProfitFires ? "take-profit" : stopLossFires ? "stop-loss" : null,
+            exitDebitToUse: Math.round(mid * 100) / 100,
+            journalSentence: takeProfitFires
+              ? `take-profit fired: live mid $${Math.round(mid * 100) / 100} against ${policy.describeTakeProfit}`
+              : stopLossFires
+                ? `stop-loss fired at ${Math.round(lossPct * 1000) / 10}% of max loss (${policy.describeStopLoss})`
+                : null,
+          };
+        }),
+      );
+
+      res.json({
+        asOf: new Date().toISOString(),
+        asOfEasternTime: new Date().toLocaleString("en-US", { timeZone: "America/New_York" }),
+        policy: {
+          takeProfitMode: policy.takeProfitMode,
+          takeProfitValue: policy.takeProfitValue,
+          describeTakeProfit: policy.describeTakeProfit,
+          stopLossPctOfMaxLoss: policy.stopLossPctOfMaxLoss,
+          describeStopLoss: policy.describeStopLoss,
+        },
+        openCount: open.length,
+        actionable: positions.filter((p: any) => p.fires).map((p: any) => p.id),
+        unpriceable: positions.filter((p: any) => !p.priced).map((p: any) => p.id),
+        positions,
+      });
     } catch (err) {
       next(err);
     }
