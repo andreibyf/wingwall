@@ -1,7 +1,7 @@
 import { Link, useLocation } from "wouter";
 import type { ReactNode } from "react";
 import { WingwallLogo } from "./Logo";
-import { LayoutGrid, LineChart, Flag, BookText, Gauge } from "lucide-react";
+import { LayoutGrid, LineChart, Flag, BookText, Gauge, SlidersHorizontal } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const NAV = [
@@ -10,6 +10,7 @@ const NAV = [
   { href: "/builder", label: "Builder", icon: LineChart },
   { href: "/campaign", label: "Campaign", icon: Flag },
   { href: "/journal", label: "Journal", icon: BookText },
+  { href: "/settings", label: "Settings", icon: SlidersHorizontal },
 ];
 
 export function Shell({ children }: { children: ReactNode }) {

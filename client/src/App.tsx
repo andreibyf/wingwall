@@ -10,6 +10,7 @@ import Builder from "@/pages/Builder";
 import Campaign from "@/pages/Campaign";
 import Journal from "@/pages/Journal";
 import Cockpit from "@/pages/Cockpit";
+import Settings from "@/pages/Settings";
 import { Shell } from "@/components/app/Shell";
 import { ExtremeTracker } from "@/components/app/ExtremeTracker";
 import { CopilotWidget } from "@/components/app/CopilotWidget";
@@ -23,6 +24,7 @@ function AppRouter() {
         <Route path="/builder" component={Builder} />
         <Route path="/campaign" component={Campaign} />
         <Route path="/journal" component={Journal} />
+        <Route path="/settings" component={Settings} />
         <Route component={NotFound} />
       </Switch>
     </Shell>
