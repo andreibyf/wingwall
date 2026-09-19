@@ -468,7 +468,7 @@ export async function registerRoutes(
   // (and debugged) independently of a model call.
   app.get("/api/copilot/context", async (_req, res, next) => {
     try {
-      res.json(await buildSignalSnapshot(getFlyLivePricing));
+      res.json(await buildSignalSnapshot(getFlyLivePricing, getChain));
     } catch (err) {
       next(err);
     }
@@ -493,7 +493,7 @@ export async function registerRoutes(
         return res.status(400).json({ message: "No valid messages provided" });
       }
 
-      const snapshot = await buildSignalSnapshot(getFlyLivePricing);
+      const snapshot = await buildSignalSnapshot(getFlyLivePricing, getChain);
       const result = await runCopilotChat(messages, snapshot);
       res.json(result);
     } catch (err) {

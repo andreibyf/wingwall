@@ -18,6 +18,7 @@
 import type { Fly } from "@shared/schema";
 import { getMultiplier } from "@shared/flyMath";
 import { storage } from "./storage";
+import { analyzeChain, MONDAY_TO_THURSDAY_TRADING_DAYS, type ChainFn } from "./chain-analysis";
 
 // Overridable so the service can be pointed at a gateway/proxy (or a stub during testing)
 // without a code change. Defaults to Anthropic directly.
@@ -151,7 +152,7 @@ function realizedFor(fly: Fly): { pnl: number; r: number } | null {
  * `priceFly` is injected by the caller so this module and the route layer share exactly
  * one pricing path (IBKR-first, Cboe fallback) and avoid a circular import.
  */
-export async function buildSignalSnapshot(priceFly: PricingFn) {
+export async function buildSignalSnapshot(priceFly: PricingFn, fetchChain?: ChainFn) {
   const today = todayIso();
   const nowEt = new Date().toLocaleString("en-US", { timeZone: "America/New_York" });
 
@@ -306,6 +307,31 @@ export async function buildSignalSnapshot(priceFly: PricingFn) {
 
   const checklist = currentWall ? await storage.getChecklist(currentWall.weekOf) : null;
 
+  // --- Chain analysis -------------------------------------------------------
+  // Computed here rather than left to the model. The copilot cannot be trusted with
+  // this arithmetic (it could not determine a weekday), and these numbers drive strike
+  // selection, so a confident miscalculation would be expensive. A chain outage must
+  // not take the whole copilot down with it, so failures degrade to available:false.
+  const cal = tradingCalendar(today);
+  const targetExpiration = cal.thursdayExpiration.slice(0, 10);
+  let chainAnalysis: ReturnType<typeof analyzeChain> = {
+    available: false,
+    reason: "Chain analysis was not requested for this snapshot.",
+  };
+  if (fetchChain) {
+    try {
+      const chain = await fetchChain(settings.defaultSymbol);
+      chainAnalysis = analyzeChain(chain, targetExpiration, MONDAY_TO_THURSDAY_TRADING_DAYS, today);
+    } catch (err) {
+      chainAnalysis = {
+        available: false,
+        reason: `Could not load the ${settings.defaultSymbol} option chain: ${
+          err instanceof Error ? err.message : String(err)
+        }. Say the chain is unavailable rather than reasoning from remembered levels.`,
+      };
+    }
+  }
+
   // Spot only appears here when an open position was priced this request. With a flat
   // book there is no live quote in the snapshot, and the prompt requires the model to say
   // so rather than fabricate one.
@@ -317,6 +343,7 @@ export async function buildSignalSnapshot(priceFly: PricingFn) {
     today,
     // Authoritative dates. The prompt forbids the model from deriving weekdays itself.
     calendar: tradingCalendar(today),
+    chainAnalysis,
     account: {
       balance: settings?.accountBalance ?? null,
       riskPerTradePercent: settings?.riskPerTradePercent ?? null,
@@ -389,6 +416,12 @@ You are ADVICE-ONLY. You cannot place, modify, or close positions, and you canno
 
 ## Live context
 Every message includes a DESK SNAPSHOT JSON block: account settings, open positions priced live with their distance to each automated threshold, the realized performance ledger, the most recent campaign wall with a staleness flag, the execution checklist, and the recent journal. Ground every specific number in that snapshot. If a value you need is absent or pricing is unavailable, say so plainly — never invent a spot price, a strike, a wall level, or a fill.
+
+Chain analysis. The snapshot carries a chainAnalysis block computed server-side from the live option chain. Quote its numbers verbatim and never recalculate, re-rank, or estimate them; you are not reliable at this arithmetic and these values drive strike selection. When available is false, say the chain is unavailable and give the reason field — never substitute remembered or plausible-sounding levels.
+
+Use the two lenses the way the playbook intends. gammaWall.topStrikes is the largest-gamma lens and is the correct basis for body placement. It can disagree sharply with a raw open-interest ranking, and when it does, trust it: a far out-of-the-money strike can carry enormous open interest while contributing almost no gamma, which makes it look like a wall in a table while exerting no pinning force. structuralPutWall and structuralCallWall are the durable levels aggregated across all expirations — useful context for where price may travel, but a heavy structural strike is not automatically a valid body.
+
+bodyCandidates already scores each level against the playbook's two-expected-move limit. Recommend only strikes with qualifiesAsPinBody true, and when the operator asks about one that is false, quote its verdict and decline rather than softening it. If every candidate is disqualified, the honest answer is that no valid pin body exists this week and the correct action is to stand down, not to pick the least-bad strike. When liquidity.isThin is true, lead with liquidity.warning before naming any level from that expiration, and describe those levels as provisional.
 
 Wall staleness. The snapshot field is mostRecentCampaignWall, not "current" — the newest stored wall is often weeks old. When isStale is true you must lead with the staleWarning before any discussion of that wall, describe its branch in the past tense as what WAS keyed for its week, and never answer "what is my current branch" with a stale branch as though it governs today. The correct answer in that case is that no wall has been keyed for the current week yet and one must be run before trading. A stale wall's referenceClose, gapPercent and notes are historical too; do not present them as this week's levels.
 
