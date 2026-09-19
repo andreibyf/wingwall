@@ -10,6 +10,8 @@ import {
   insertJournalNoteSchema,
 } from "@shared/schema";
 import { computeFlyPricing, getMultiplier, type ChainLeg } from "@shared/flyMath";
+import { z } from "zod";
+import { runAutoTrade, tradingWeek } from "./auto-trade";
 import { getIbkrFlyQuote, isIbkrSupported, IbkrPricingError } from "./ibkr";
 import {
   buildSignalSnapshot,
@@ -418,10 +420,105 @@ export async function registerRoutes(
     }
   });
 
+  // Bounded, because these fields now drive automation that runs unattended. The schema
+  // generated from the table only constrains types, so a mistyped stop of 40 instead of
+  // -0.4 would have been stored happily and then compared against a P&L fraction that can
+  // never reach it, quietly disabling the stop on every position. Each bound below is the
+  // range in which the value has a defined meaning, not a matter of taste.
+  const settingsBoundsSchema = z
+    .object({
+      accountBalance: z.number().positive().max(100_000_000),
+      riskPerTradePercent: z.number().positive().max(100),
+      defaultSymbol: z.enum(["QQQ", "SPY"]),
+      takeProfitMode: z.enum(["multipleOfDebit", "pctOfMaxProfit"]),
+      // A multiple at or below 1.0 exits at or below cost; a fraction of max profit above
+      // 1.0 is unreachable by definition. One field, two modes, so the useful floor is
+      // "greater than zero" and the mode-specific check follows in superRefine.
+      takeProfitValue: z.number().positive().max(20),
+      // Must be negative: it is compared against a signed loss fraction, so a positive
+      // value can never trigger.
+      stopLossPctOfMaxLoss: z.number().min(-1).max(-0.01),
+      targetDebitToWidth: z.number().positive().max(0.5),
+      maxDebitToWidth: z.number().positive().max(0.9),
+      autoTradeEnabled: z.boolean(),
+    })
+    .partial()
+    .superRefine((val, ctx) => {
+      if (val.takeProfitMode === "multipleOfDebit" && val.takeProfitValue !== undefined && val.takeProfitValue <= 1) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["takeProfitValue"],
+          message: "A debit multiple must exceed 1.0, or the target sits at or below what was paid.",
+        });
+      }
+      if (val.takeProfitMode === "pctOfMaxProfit" && val.takeProfitValue !== undefined && val.takeProfitValue > 1) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["takeProfitValue"],
+          message: "A fraction of max profit cannot exceed 1.0.",
+        });
+      }
+      if (
+        val.targetDebitToWidth !== undefined &&
+        val.maxDebitToWidth !== undefined &&
+        val.targetDebitToWidth > val.maxDebitToWidth
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["targetDebitToWidth"],
+          message: "The target debit-to-width cannot exceed the ceiling.",
+        });
+      }
+    });
+
   app.put("/api/settings", async (req, res, next) => {
     try {
-      const parsed = insertSettingsSchema.partial().parse(req.body);
-      res.json(await storage.updateSettings(parsed));
+      const typed = insertSettingsSchema.partial().parse(req.body);
+      // Cross-field checks need the stored mode when the client sends only a value.
+      const current = await storage.getSettings();
+      const merged = { ...typed } as Record<string, unknown>;
+      if (merged.takeProfitValue !== undefined && merged.takeProfitMode === undefined) {
+        merged.takeProfitMode = current?.takeProfitMode ?? "multipleOfDebit";
+      }
+      if (merged.targetDebitToWidth !== undefined && merged.maxDebitToWidth === undefined) {
+        merged.maxDebitToWidth = current?.maxDebitToWidth ?? 0.15;
+      }
+      settingsBoundsSchema.parse(merged);
+      res.json(await storage.updateSettings(typed));
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ---- Autonomous entry ----
+  // Preview always runs regardless of the toggle and never writes: it is how the operator
+  // inspects what the engine would do before trusting it to act.
+  app.get("/api/auto-trade/preview", async (_req, res, next) => {
+    try {
+      res.json(
+        await runAutoTrade({
+          fetchChain: (symbol: string) => getChain(symbol),
+          buildSnapshot: () => buildSignalSnapshot(getFlyLivePricing, getChain),
+          }, { dryRun: true, ignoreToggle: true }),
+      );
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // The live run honours the toggle. No ignoreToggle escape hatch is exposed, so nothing
+  // reachable over HTTP can open a position the operator has not switched on.
+  app.post("/api/auto-trade/run", async (req, res, next) => {
+    try {
+      res.json(
+        await runAutoTrade(
+          {
+            fetchChain: (symbol: string) => getChain(symbol),
+            buildSnapshot: () => buildSignalSnapshot(getFlyLivePricing, getChain),
+          },
+          { dryRun: req.body?.dryRun === true },
+        ),
+      );
     } catch (err) {
       next(err);
     }

@@ -71,14 +71,31 @@ app.use((req, res, next) => {
   await registerRoutes(httpServer, app);
 
   app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) {
+      return next(err);
+    }
+
+    // A schema rejection is the client sending something invalid, not the server failing.
+    // It used to fall through to a 500 with the issue list stuffed into `message` as a JSON
+    // string, so a form could only report "something went wrong" instead of naming the bad
+    // field. Now it comes back as a 400 with the issues addressable per field.
+    const issues = err?.issues ?? err?.errors;
+    if (err?.name === "ZodError" && Array.isArray(issues)) {
+      const fieldErrors = issues.map((i: any) => ({
+        field: Array.isArray(i.path) ? i.path.join(".") : String(i.path ?? ""),
+        message: String(i.message ?? "invalid value"),
+      }));
+      console.warn("Validation rejected:", fieldErrors);
+      return res.status(400).json({
+        message: fieldErrors.map((f: any) => (f.field ? `${f.field}: ${f.message}` : f.message)).join(" "),
+        fieldErrors,
+      });
+    }
+
     const status = err.status || err.statusCode || 500;
     const message = err.message || "Internal Server Error";
 
     console.error("Internal Server Error:", err);
-
-    if (res.headersSent) {
-      return next(err);
-    }
 
     return res.status(status).json({ message });
   });
