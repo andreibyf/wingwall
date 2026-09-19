@@ -181,7 +181,14 @@ export function analyzeChain(
   chain: ChainData | null,
   targetExpiration: string,
   tradingDaysToExpiration = MONDAY_TO_THURSDAY_TRADING_DAYS,
-  today?: string,
+  // Accepts a Date as well as an ISO string. This used to be string-only and interpolated
+  // straight into a template, so a Date silently produced an invalid date, todayMs became
+  // NaN, and every `expMs < NaN` comparison returned false -- disabling the expired-
+  // expiration filter without a single error. The depth comparison then anchored on an
+  // already-settled expiration carrying a million contracts of open interest, making a
+  // normal expiration look 3% as deep as its neighbour. Normalised here so the failure is
+  // impossible rather than merely documented.
+  today?: string | Date,
 ): ChainAnalysis {
   if (!chain || !Array.isArray(chain.options) || chain.options.length === 0) {
     return { available: false, reason: "No option chain data was returned for this symbol." };
@@ -230,7 +237,14 @@ export function analyzeChain(
   // "3% as deep" against the 1.1M OI still sitting on the 09-18 expiry from the day
   // before. Comparing a live expiration against a dead one flags every chain as thin.
   const targetMs = new Date(`${targetExpiration}T12:00:00Z`).getTime();
-  const todayMs = today ? new Date(`${today}T12:00:00Z`).getTime() : null;
+  const todayIsoDate =
+    today instanceof Date ? today.toISOString().slice(0, 10) : today ? String(today).slice(0, 10) : null;
+  const parsedToday = todayIsoDate ? new Date(`${todayIsoDate}T12:00:00Z`).getTime() : null;
+  if (todayIsoDate && (parsedToday === null || Number.isNaN(parsedToday))) {
+    // Loud, because the silent version of this cost a bogus liquidity comparison.
+    throw new Error(`analyzeChain received an unparseable 'today' value: ${String(today)}`);
+  }
+  const todayMs = parsedToday;
   const nearby = Array.from(depth.entries()).filter(([exp]) => {
     const expMs = new Date(`${exp}T12:00:00Z`).getTime();
     if (todayMs !== null && expMs < todayMs) return false; // already expired

@@ -19,6 +19,11 @@ import type { Fly } from "@shared/schema";
 import { getMultiplier } from "@shared/flyMath";
 import { storage } from "./storage";
 import { analyzeChain, MONDAY_TO_THURSDAY_TRADING_DAYS, type ChainFn } from "./chain-analysis";
+import {
+  resolveExitPolicy,
+  assessThresholdReachability,
+  type ExitPolicy,
+} from "../shared/exit-policy";
 
 // Overridable so the service can be pointed at a gateway/proxy (or a stub during testing)
 // without a code change. Defaults to Anthropic directly.
@@ -29,10 +34,11 @@ const ANTHROPIC_VERSION = "2023-06-01";
 const DEFAULT_MODEL = process.env.COPILOT_MODEL || "claude-haiku-4-5";
 const MAX_TOKENS = Number(process.env.COPILOT_MAX_TOKENS) || 1400;
 
-// Thresholds the automated watch enforces. Kept in sync with the scheduled job so the
-// copilot quotes the same numbers that will actually fire.
-const TAKE_PROFIT_PCT = 0.25; // of maxProfit
-const STOP_LOSS_PCT = -0.4; // of maxLoss
+// Thresholds used to live here as a pair of constants that silently duplicated
+// shared/thresholds.ts without importing it, so changing one left the copilot quoting a
+// policy the automation would not actually apply. They now come from the settings row via
+// resolveExitPolicy, which is the only source the cockpit, the copilot and the scheduled
+// job all read.
 
 /**
  * Read the key defensively. Pasting into a dashboard field very often carries a trailing
@@ -148,6 +154,24 @@ function realizedFor(fly: Fly): { pnl: number; r: number } | null {
 }
 
 /**
+ * Whether the take-profit condition is met, under whichever mode is configured. A debit
+ * multiple tests the live debit against what was paid; a percent-of-max-profit tests the
+ * P&L fraction. Kept in one function so the two modes cannot drift apart between the
+ * snapshot, the cockpit and the scheduled job.
+ */
+function takeProfitFiresFor(
+  policy: ExitPolicy,
+  entryDebit: number,
+  midDebit: number,
+  profitPct: number,
+): boolean {
+  if (policy.takeProfitMode === "multipleOfDebit") {
+    return entryDebit > 0 && midDebit >= entryDebit * policy.takeProfitValue;
+  }
+  return profitPct >= policy.takeProfitValue;
+}
+
+/**
  * Everything the copilot is allowed to see, gathered fresh per request.
  * `priceFly` is injected by the caller so this module and the route layer share exactly
  * one pricing path (IBKR-first, Cboe fallback) and avoid a circular import.
@@ -162,6 +186,15 @@ export async function buildSignalSnapshot(priceFly: PricingFn, fetchChain?: Chai
     storage.listCampaignWalls(),
     storage.listJournalNotes(),
   ]);
+
+  // One resolution of the exit policy per snapshot, shared by every position below and by
+  // the automatedThresholds block, so nothing in a single response can disagree with
+  // anything else about when an exit fires.
+  const exitPolicy = resolveExitPolicy({
+    takeProfitMode: settings?.takeProfitMode ?? "multipleOfDebit",
+    takeProfitValue: settings?.takeProfitValue ?? 2.0,
+    stopLossPctOfMaxLoss: settings?.stopLossPctOfMaxLoss ?? -0.4,
+  });
 
   const openFlies = allFlies.filter((f) => f.status === "open");
   const closedFlies = allFlies.filter((f) => f.status === "closed");
@@ -223,12 +256,35 @@ export async function buildSignalSnapshot(priceFly: PricingFn, fetchChain?: Chai
             // be used to talk about threshold proximity.
             profitPctOfMaxProfit: round(profitPct, 4),
             lossPctOfMaxLoss: round(lossPct, 4),
-            takeProfitFires: profitPct >= TAKE_PROFIT_PCT,
-            stopLossFires: lossPct <= STOP_LOSS_PCT,
+            takeProfitFires: takeProfitFiresFor(exitPolicy, fly.entryDebit, p.midDebit, profitPct),
+            stopLossFires: lossPct <= exitPolicy.stopLossPctOfMaxLoss,
             // Signed gaps to each trigger, in the same units as the fraction they test.
             // Positive = not yet triggered, and the value is how far it still has to travel.
-            takeProfitGapRemainingPct: round(TAKE_PROFIT_PCT - profitPct, 4),
-            stopLossGapRemainingPct: round(lossPct - STOP_LOSS_PCT, 4),
+            takeProfitGapRemainingPct:
+              exitPolicy.takeProfitMode === "pctOfMaxProfit"
+                ? round(exitPolicy.takeProfitValue - profitPct, 4)
+                : null,
+            // Under a debit-multiple policy the meaningful gap is in debit terms, not as a
+            // fraction of a max profit the target no longer references.
+            takeProfitTargetDebit:
+              exitPolicy.takeProfitMode === "multipleOfDebit"
+                ? round(fly.entryDebit * exitPolicy.takeProfitValue)
+                : null,
+            stopLossGapRemainingPct: round(lossPct - exitPolicy.stopLossPctOfMaxLoss, 4),
+            // Precomputed because the model cannot divide: what each threshold demands, as
+            // a multiple of what was paid, with an explicit flag when the target is out of
+            // reach. A 25%-of-max-profit target on a cheap far-body fly needed 4-5x the
+            // debit on every trade in this book, so the stop could fire and the target
+            // could not -- invisible unless it arrives pre-computed.
+            thresholdReachability: assessThresholdReachability(
+              exitPolicy,
+              fly.entryDebit,
+              fly.maxProfit,
+              fly.maxLoss,
+              fly.contracts,
+              getMultiplier(fly.symbol),
+              fly.peakProfitPct,
+            ),
             bodyDistanceFromSpot:
               p.spot ? round(((fly.middleStrike - p.spot) / p.spot) * 100) : null,
             breakevenLower: round(p.breakevenLower),
@@ -354,10 +410,16 @@ export async function buildSignalSnapshot(priceFly: PricingFn, fetchChain?: Chai
       defaultSymbol: settings?.defaultSymbol ?? null,
     },
     automatedThresholds: {
-      takeProfitAtPctOfMaxProfit: TAKE_PROFIT_PCT,
-      stopLossAtPctOfMaxLoss: STOP_LOSS_PCT,
+      takeProfitMode: exitPolicy.takeProfitMode,
+      takeProfitValue: exitPolicy.takeProfitValue,
+      takeProfitDescription: exitPolicy.describeTakeProfit,
+      stopLossAtPctOfMaxLoss: exitPolicy.stopLossPctOfMaxLoss,
+      stopLossDescription: exitPolicy.describeStopLoss,
+      configuredIn: "Settings, stored in the database — not hardcoded",
       note:
-        "A scheduled job checks open flies hourly during market hours and auto-closes on either threshold. profitPct divides by maxProfit; lossPct divides by maxLoss.",
+        "A scheduled job checks open flies hourly during market hours and auto-closes on " +
+        "either threshold. Read takeProfitDescription rather than assuming a percent-of-max-" +
+        "profit rule; the default is a multiple of the entry debit.",
     },
     openPositions: open,
     capitalDeployed: round(openFlies.reduce((s, f) => s + f.maxLoss, 0)),
@@ -427,7 +489,7 @@ Wall staleness. The snapshot field is mostRecentCampaignWall, not "current" — 
 
 Dates and weekdays. NEVER derive, count, or guess a weekday, a week-start, or an expiration date yourself — you get this wrong. The snapshot's calendar block already carries today's date, whether the market is open today, the keying Monday, and that week's Thursday expiration, each labelled with its weekday. Quote those verbatim and use no other dates. If the user needs a date the calendar block does not contain, say you will not guess it rather than computing it. When calendar.isWeekend is true, today is not a trading day and the keying Monday and Thursday expiration refer to the upcoming week, not the one that just ended.
 
-Reading the threshold fields correctly. The two threshold fractions are asymmetric by design: profitPctOfMaxProfit divides P&L by max profit, lossPctOfMaxLoss divides the SAME signed P&L by max loss. So a winning position shows a positive lossPctOfMaxLoss — that does NOT mean it is partway to the stop. Only takeProfitFires / stopLossFires and the two GapRemainingPct fields describe threshold proximity; never narrate lossPctOfMaxLoss as progress toward a stop on a position that is up. Take-profit fires at profitPctOfMaxProfit >= 0.25, stop-loss at lossPctOfMaxLoss <= -0.40. A position priced with available:false has no P&L this request — say the pricing is unavailable and give the reason field, rather than reasoning from the entry debit as if it were current.
+Reading the threshold fields correctly. The two threshold fractions are asymmetric by design: profitPctOfMaxProfit divides P&L by max profit, lossPctOfMaxLoss divides the SAME signed P&L by max loss. So a winning position shows a positive lossPctOfMaxLoss — that does NOT mean it is partway to the stop. Only takeProfitFires / stopLossFires and the two GapRemainingPct fields describe threshold proximity; never narrate lossPctOfMaxLoss as progress toward a stop on a position that is up. Never state a threshold from memory: the exit policy is configurable and lives in the snapshot. Read automatedThresholds.takeProfitDescription and stopLossDescription for the rule in force, and per-position thresholdReachability for what each exit demands. The default take-profit is a MULTIPLE OF THE ENTRY DEBIT, not a percent of max profit, so do not describe it as a percentage. When thresholdReachability.takeProfitIsUnreachable is true, say so plainly and quote unreachableReason -- it means the stop can fire while the target cannot, and the operator needs to hear that before the position decays rather than after. A position priced with available:false has no P&L this request — say the pricing is unavailable and give the reason field, rather than reasoning from the entry debit as if it were current.
 
 ## The operator's playbook — reason within it, do not improvise a new method
 
@@ -455,6 +517,56 @@ Be honest about limits. You have no live news feed, no gamma-exposure map, and n
 The account is small (roughly $1,000 of real practice capital) and the operator is newer to this, so weight capital preservation and mechanical discipline over cleverness, and flag when a proposed trade breaks a sizing or window rule.
 
 Keep replies tight — a few short paragraphs or a compact list. This renders in a small floating chat panel, so no long preambles, and use markdown sparingly (bold and simple bullets only, no tables or headers).`;
+
+/**
+ * Single-turn model call with a caller-supplied system prompt. Exposed so the auto-trade
+ * gatekeeper can reuse this module's key handling, base URL and model selection instead of
+ * building a second, separately-configured client that could drift to a different model.
+ */
+export async function callModelOnce(
+  system: string,
+  userContent: string,
+  maxTokens = 1200,
+): Promise<{ text: string; model: string }> {
+  const apiKey = readApiKey();
+  if (!apiKey) throw Object.assign(new Error("Copilot is not configured"), { status: 503 });
+
+  const res = await fetch(`${ANTHROPIC_BASE}/messages`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": ANTHROPIC_VERSION,
+    },
+    body: JSON.stringify({
+      model: DEFAULT_MODEL,
+      max_tokens: maxTokens,
+      system,
+      messages: [{ role: "user", content: userContent }],
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    let detail = body.slice(0, 400);
+    try {
+      detail = JSON.parse(body)?.error?.message ?? detail;
+    } catch {
+      /* keep raw text */
+    }
+    throw Object.assign(new Error(`Anthropic API ${res.status}: ${detail}`), { status: 502 });
+  }
+
+  const data = await res.json();
+  const text = Array.isArray(data?.content)
+    ? data.content
+        .filter((b: any) => b?.type === "text")
+        .map((b: any) => b.text)
+        .join("")
+        .trim()
+    : "";
+  return { text, model: data?.model ?? DEFAULT_MODEL };
+}
 
 export type CopilotResult = { reply: string; model: string };
 
