@@ -335,17 +335,36 @@ export async function buildSignalSnapshot(priceFly: PricingFn) {
     openPositions: open,
     capitalDeployed: round(openFlies.reduce((s, f) => s + f.maxLoss, 0)),
     performance,
-    currentCampaignWall: currentWall
-      ? {
-          symbol: currentWall.symbol,
-          weekOf: currentWall.weekOf,
-          wallPrice: currentWall.wallPrice,
-          referenceClose: currentWall.referenceClose,
-          activeBranch: currentWall.activeBranch,
-          gapPercent: currentWall.gapPercent,
-          reKeyed: currentWall.reKeyed,
-          notes: currentWall.notes,
-        }
+    // Deliberately named mostRecentCampaignWall, not "current". The newest stored wall is
+    // frequently weeks old, and calling it "current" invited confidently reporting a stale
+    // branch as if it governed today. Staleness is computed here so it cannot be overlooked.
+    mostRecentCampaignWall: currentWall
+      ? (() => {
+          const cal = tradingCalendar(today);
+          const keyingMondayIso = cal.keyingMonday.slice(0, 10);
+          const weeksOld = Math.floor(
+            (new Date(`${keyingMondayIso}T12:00:00Z`).getTime() -
+              new Date(`${currentWall.weekOf}T12:00:00Z`).getTime()) /
+              (7 * 86_400_000),
+          );
+          const isStale = currentWall.weekOf !== keyingMondayIso;
+          return {
+            symbol: currentWall.symbol,
+            weekOf: currentWall.weekOf,
+            wallPrice: currentWall.wallPrice,
+            referenceClose: currentWall.referenceClose,
+            activeBranch: currentWall.activeBranch,
+            gapPercent: currentWall.gapPercent,
+            reKeyed: currentWall.reKeyed,
+            notes: currentWall.notes,
+            isStale,
+            weeksOld: Math.max(0, weeksOld),
+            appliesToKeyingMonday: keyingMondayIso,
+            staleWarning: isStale
+              ? `This wall was keyed for the week of ${currentWall.weekOf} and does NOT govern the keying week of ${keyingMondayIso}. Its levels, branch, reference close and gap are historical. Say so before discussing it, and do not present its branch as the current one.`
+              : null,
+          };
+        })()
       : null,
     priorCampaignWalls: priorWalls.map((w) => ({
       symbol: w.symbol,
@@ -369,7 +388,9 @@ const SYSTEM_PROMPT = `You are the Wingwall trading copilot — an in-app assist
 You are ADVICE-ONLY. You cannot place, modify, or close positions, and you cannot write journal entries. Never claim to have done any of those. When an action is warranted, tell the operator exactly what to do and where in the app to do it.
 
 ## Live context
-Every message includes a DESK SNAPSHOT JSON block: account settings, open positions priced live with their distance to each automated threshold, the realized performance ledger, the current campaign wall and branch, the execution checklist, and the recent journal. Ground every specific number in that snapshot. If a value you need is absent or pricing is unavailable, say so plainly — never invent a spot price, a strike, a wall level, or a fill.
+Every message includes a DESK SNAPSHOT JSON block: account settings, open positions priced live with their distance to each automated threshold, the realized performance ledger, the most recent campaign wall with a staleness flag, the execution checklist, and the recent journal. Ground every specific number in that snapshot. If a value you need is absent or pricing is unavailable, say so plainly — never invent a spot price, a strike, a wall level, or a fill.
+
+Wall staleness. The snapshot field is mostRecentCampaignWall, not "current" — the newest stored wall is often weeks old. When isStale is true you must lead with the staleWarning before any discussion of that wall, describe its branch in the past tense as what WAS keyed for its week, and never answer "what is my current branch" with a stale branch as though it governs today. The correct answer in that case is that no wall has been keyed for the current week yet and one must be run before trading. A stale wall's referenceClose, gapPercent and notes are historical too; do not present them as this week's levels.
 
 Dates and weekdays. NEVER derive, count, or guess a weekday, a week-start, or an expiration date yourself — you get this wrong. The snapshot's calendar block already carries today's date, whether the market is open today, the keying Monday, and that week's Thursday expiration, each labelled with its weekday. Quote those verbatim and use no other dates. If the user needs a date the calendar block does not contain, say you will not guess it rather than computing it. When calendar.isWeekend is true, today is not a trading day and the keying Monday and Thursday expiration refer to the upcoming week, not the one that just ended.
 
