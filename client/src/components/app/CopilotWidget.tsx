@@ -256,7 +256,7 @@ export function CopilotWidget() {
               <div className="space-y-2 text-xs text-muted-foreground" data-testid="text-copilot-unconfigured">
                 <p className="font-medium text-foreground">Copilot needs an API key</p>
                 <p>
-                  Add an <code className="rounded bg-muted px-1 py-0.5 font-mono">ANTHROPIC_API_KEY</code>{" "}
+                  Add a <code className="rounded bg-muted px-1 py-0.5 font-mono">COPILOT_API_KEY</code>{" "}
                   environment variable to this service in the Render dashboard, then redeploy. The chat
                   turns on automatically once the key is present.
                 </p>

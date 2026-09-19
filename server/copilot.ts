@@ -33,8 +33,44 @@ const MAX_TOKENS = Number(process.env.COPILOT_MAX_TOKENS) || 1400;
 const TAKE_PROFIT_PCT = 0.25; // of maxProfit
 const STOP_LOSS_PCT = -0.4; // of maxLoss
 
+/**
+ * Read the key defensively. Pasting into a dashboard field very often carries a trailing
+ * newline or a stray space, and Anthropic rejects that with a 401 that looks identical to
+ * a genuinely bad key — so trim rather than making the user hunt for invisible whitespace.
+ */
+function readApiKey(): string {
+  // COPILOT_API_KEY is the preferred name because the base URL may point at any
+  // Anthropic-Messages-compatible provider (e.g. Perplexity's router), where a variable
+  // called ANTHROPIC_API_KEY is actively misleading. The old name still works.
+  const raw = process.env.COPILOT_API_KEY ?? process.env.ANTHROPIC_API_KEY ?? "";
+  return raw.trim();
+}
+
 export function isCopilotConfigured(): boolean {
-  return Boolean(process.env.ANTHROPIC_API_KEY);
+  return readApiKey().length > 0;
+}
+
+/**
+ * Shape-only facts about the configured key, for diagnosing a 401 without ever exposing the
+ * secret. Reveals nothing beyond length, the public prefix, and whether stray whitespace or
+ * quote characters were wrapped around it.
+ */
+export function describeApiKeyShape() {
+  const fromPreferred = process.env.COPILOT_API_KEY;
+  const raw = fromPreferred ?? process.env.ANTHROPIC_API_KEY ?? "";
+  const trimmed = raw.trim();
+  return {
+    present: raw.length > 0,
+    readFrom: fromPreferred ? "COPILOT_API_KEY" : "ANTHROPIC_API_KEY",
+    length: trimmed.length,
+    prefix: trimmed.slice(0, 7),
+    looksLikeAnthropicKey: trimmed.startsWith("sk-ant-"),
+    looksLikePerplexityKey: trimmed.startsWith("pplx-"),
+    baseUrl: ANTHROPIC_BASE,
+    hadSurroundingWhitespace: raw !== trimmed,
+    hasInteriorWhitespace: /\s/.test(trimmed),
+    isQuoteWrapped: /^["'].*["']$/.test(trimmed),
+  };
 }
 
 export type ChatMessage = { role: "user" | "assistant"; content: string };
@@ -51,6 +87,43 @@ type PricingFn = (
 
 function todayIso(): string {
   return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+}
+
+/**
+ * Precompute the week's key dates so the model never performs weekday arithmetic itself.
+ * Language models reliably get this wrong — an early version of this copilot told the user to
+ * key the "week of 2026-09-16" (a Wednesday) and pull the "2026-09-26" expiry (a Saturday).
+ * Deriving these from the calendar and labelling every date with its weekday removes the
+ * opportunity for that class of error entirely.
+ */
+function tradingCalendar(today: string) {
+  const withDay = (iso: string) =>
+    `${iso} (${new Date(`${iso}T12:00:00Z`).toLocaleDateString("en-US", { weekday: "long", timeZone: "UTC" })})`;
+
+  const shift = (iso: string, days: number) =>
+    new Date(new Date(`${iso}T12:00:00Z`).getTime() + days * 86_400_000)
+      .toISOString()
+      .slice(0, 10);
+
+  // getUTCDay: 0=Sun … 6=Sat. Anchor on the Monday of the current calendar week; on a
+  // weekend, roll forward to the coming Monday since no trade is keyed on a closed market.
+  const dow = new Date(`${today}T12:00:00Z`).getUTCDay();
+  const isWeekend = dow === 0 || dow === 6;
+  const mondayOffset = dow === 0 ? 1 : dow === 6 ? 2 : 1 - dow;
+  const keyingMonday = shift(today, mondayOffset);
+  const thursdayExpiration = shift(keyingMonday, 3);
+
+  return {
+    today: withDay(today),
+    isWeekend,
+    marketOpenToday: !isWeekend,
+    keyingMonday: withDay(keyingMonday),
+    thursdayExpiration: withDay(thursdayExpiration),
+    tradingDaysMondayToThursday: 3,
+    note: isWeekend
+      ? "Market is closed today. keyingMonday and thursdayExpiration refer to the upcoming week."
+      : "keyingMonday and thursdayExpiration refer to the current trading week.",
+  };
 }
 
 function dteFrom(expiration: string, today: string): number {
@@ -242,6 +315,8 @@ export async function buildSignalSnapshot(priceFly: PricingFn) {
   return {
     asOfEasternTime: nowEt,
     today,
+    // Authoritative dates. The prompt forbids the model from deriving weekdays itself.
+    calendar: tradingCalendar(today),
     account: {
       balance: settings?.accountBalance ?? null,
       riskPerTradePercent: settings?.riskPerTradePercent ?? null,
@@ -296,6 +371,8 @@ You are ADVICE-ONLY. You cannot place, modify, or close positions, and you canno
 ## Live context
 Every message includes a DESK SNAPSHOT JSON block: account settings, open positions priced live with their distance to each automated threshold, the realized performance ledger, the current campaign wall and branch, the execution checklist, and the recent journal. Ground every specific number in that snapshot. If a value you need is absent or pricing is unavailable, say so plainly — never invent a spot price, a strike, a wall level, or a fill.
 
+Dates and weekdays. NEVER derive, count, or guess a weekday, a week-start, or an expiration date yourself — you get this wrong. The snapshot's calendar block already carries today's date, whether the market is open today, the keying Monday, and that week's Thursday expiration, each labelled with its weekday. Quote those verbatim and use no other dates. If the user needs a date the calendar block does not contain, say you will not guess it rather than computing it. When calendar.isWeekend is true, today is not a trading day and the keying Monday and Thursday expiration refer to the upcoming week, not the one that just ended.
+
 Reading the threshold fields correctly. The two threshold fractions are asymmetric by design: profitPctOfMaxProfit divides P&L by max profit, lossPctOfMaxLoss divides the SAME signed P&L by max loss. So a winning position shows a positive lossPctOfMaxLoss — that does NOT mean it is partway to the stop. Only takeProfitFires / stopLossFires and the two GapRemainingPct fields describe threshold proximity; never narrate lossPctOfMaxLoss as progress toward a stop on a position that is up. Take-profit fires at profitPctOfMaxProfit >= 0.25, stop-loss at lossPctOfMaxLoss <= -0.40. A position priced with available:false has no P&L this request — say the pricing is unavailable and give the reason field, rather than reasoning from the entry debit as if it were current.
 
 ## The operator's playbook — reason within it, do not improvise a new method
@@ -331,7 +408,7 @@ export async function runCopilotChat(
   messages: ChatMessage[],
   snapshot: unknown,
 ): Promise<CopilotResult> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = readApiKey();
   if (!apiKey) throw Object.assign(new Error("Copilot is not configured"), { status: 503 });
 
   const history = messages.slice(-16).filter((m) => m.content.trim().length > 0);
@@ -396,7 +473,7 @@ export async function runCopilotChat(
 
 /** Lists model ids the configured key can actually reach — used to verify setup. */
 export async function listCopilotModels(): Promise<string[]> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = readApiKey();
   if (!apiKey) throw Object.assign(new Error("Copilot is not configured"), { status: 503 });
   const res = await fetch(`${ANTHROPIC_BASE}/models?limit=50`, {
     headers: { "x-api-key": apiKey, "anthropic-version": ANTHROPIC_VERSION },

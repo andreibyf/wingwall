@@ -17,6 +17,7 @@ import {
   isCopilotConfigured,
   listCopilotModels,
   copilotModel,
+  describeApiKeyShape,
   type ChatMessage,
 } from "./copilot";
 
@@ -445,10 +446,12 @@ export async function registerRoutes(
   });
 
   // ---- Trading copilot (advice-only chat widget) ----
-  // Reports whether an ANTHROPIC_API_KEY is present so the widget can render a setup
+  // Reports whether an API key is present so the widget can render a setup
   // message instead of a dead chat box.
   app.get("/api/copilot/status", (_req, res) => {
-    res.json({ configured: isCopilotConfigured(), model: copilotModel });
+    // `key` carries shape-only facts (length, public prefix, stray-whitespace flags) to make
+    // a 401 diagnosable. It never includes any part of the secret itself.
+    res.json({ configured: isCopilotConfigured(), model: copilotModel, key: describeApiKeyShape() });
   });
 
   // Diagnostic: which model ids the configured key can actually reach. Used to confirm
@@ -476,7 +479,7 @@ export async function registerRoutes(
       if (!isCopilotConfigured()) {
         return res.status(503).json({
           message:
-            "Copilot is not configured. Set ANTHROPIC_API_KEY in the service environment to enable it.",
+            "Copilot is not configured. Set COPILOT_API_KEY in the service environment to enable it.",
         });
       }
       const raw = Array.isArray(req.body?.messages) ? req.body.messages : null;
