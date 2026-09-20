@@ -59,9 +59,11 @@ type ChecklistPatch = {
 
 const GAP_THRESHOLD = 0.025;
 
-// Gexbot publishes the major positive/negative GEX strikes by open interest and the
-// zero-gamma line. Wingwall's wall is an OVERHEAD level, so the major POSITIVE strike is
-// the wall analogue; the major negative strike is the downside acceleration band. The keyed
+// Gexbot publishes the major positive/negative GEX levels by open interest and the
+// zero-gamma line. Wingwall's wall is an OVERHEAD level, so the major POSITIVE level is
+// the wall analogue; the major negative level is the downside acceleration band. These are
+// levels, not exchange strikes -- QQQ lists $1 increments and the live value was 720.02 --
+// so they are shown as published and never rounded to a strike. The keyed
 // wall stays the operator's number -- these are advisory, with an override button so keying
 // it does not mean retyping it.
 type GexLevels = {
@@ -159,6 +161,51 @@ export default function Campaign() {
     if (gexFresh && gexFresh.ok) return gexFresh.levels;
     return gexStatus?.cached ?? null;
   }, [gexFresh, gexStatus]);
+
+  // The wall is an OVERHEAD level: every branch is defined by how price behaves against a
+  // level ABOVE it. Writing a below-spot level into the wall does not merely mis-key it, it
+  // inverts the reading -- price would already sit above the wall, which the engine scores as
+  // sustained-through, so a support level silently presents as a confirmed BULL breaks branch.
+  // That is the worst possible failure shape here: not an error, a plausible wrong answer.
+  //
+  // This is not hypothetical. On 2026-09-20 Gexbot returned a major +GEX of 720.02 against a
+  // spot of 721.31, so the very first live response would have set a below-spot wall.
+  const overrideGuard = useMemo(() => {
+    const level = gexLevels?.callWall;
+    if (level === null || level === undefined) {
+      return { blocked: true, reason: null as string | null, gap: null as number | null };
+    }
+    const spot = gexLevels?.spot;
+    if (spot === null || spot === undefined) {
+      // Gexbot documents spot as null when it is not available to the caller. Unverifiable is
+      // not the same as wrong, so this warns instead of blocking -- but it does say plainly
+      // that the check did not run, rather than implying a pass.
+      return {
+        blocked: false,
+        reason:
+          `Cannot verify ${level.toFixed(2)} sits above spot: the provider returned no spot on ` +
+          `this key. Check it against the tape before saving.`,
+        gap: null,
+      };
+    }
+    if (level <= spot) {
+      // Equality is blocked with the rest. A wall exactly at spot is not overhead either, and
+      // it leaves the branch read undefined at the open rather than merely wrong.
+      const position =
+        level === spot
+          ? `sits exactly AT the provider spot of ${spot.toFixed(2)}`
+          : `is ${(spot - level).toFixed(2)} BELOW the provider spot of ${spot.toFixed(2)}`;
+      return {
+        blocked: true,
+        reason:
+          `Blocked: the major +GEX of ${level.toFixed(2)} ${position}, so it is not an overhead ` +
+          `wall. Keying it would read as price already at or through the wall and score a false ` +
+          `breaks (bull) branch. Use it as a downside marker instead.`,
+        gap: level - spot,
+      };
+    }
+    return { blocked: false, reason: null, gap: level - spot };
+  }, [gexLevels]);
 
   const existing = useMemo(
     () => (walls ?? []).find((w) => w.symbol === symbol && w.weekOf === weekOf),
@@ -405,23 +452,45 @@ export default function Campaign() {
                 size="sm"
                 onClick={() => {
                   const cw = gexLevels?.callWall;
-                  if (cw === null || cw === undefined) return;
+                  // Re-checked here as well as in the disabled state: a stale render or a
+                  // keyboard activation must not be able to slip a below-spot wall through.
+                  if (cw === null || cw === undefined || overrideGuard.blocked) return;
+                  // Written at full published precision. Rounding to a whole strike would
+                  // assert this level IS a strike (it is not), and rounding either way shifts
+                  // the wall relative to spot, which is the exact quantity every branch is
+                  // scored against -- so it would bias branch selection to buy tidiness.
                   setWallPrice(String(cw));
+                  const gapNote =
+                    overrideGuard.gap !== null
+                      ? ` It sits ${overrideGuard.gap.toFixed(2)} above spot.`
+                      : "";
                   toast({
                     title: "Wall overridden from Gexbot",
-                    description: `Major +GEX ${cw.toFixed(2)} loaded — press ${existing ? "Update" : "Save"} wall to store it.`,
+                    description:
+                      `Major +GEX ${cw.toFixed(2)} loaded.${gapNote} Press ${existing ? "Update" : "Save"} wall to store it.`,
                   });
                 }}
-                disabled={gexLevels?.callWall === null || gexLevels?.callWall === undefined}
+                disabled={overrideGuard.blocked}
                 data-testid="button-gex-use-call-wall"
               >
                 Use major +GEX
               </Button>
             </div>
+            {overrideGuard.reason && (
+              <p
+                className="mt-2 rounded border border-destructive/40 bg-destructive/10 p-2 text-[11px] leading-relaxed text-destructive"
+                data-testid="text-gex-override-guard"
+              >
+                {overrideGuard.reason}
+              </p>
+            )}
+
             <p className="mt-2 text-[10px] leading-relaxed text-muted-foreground">
               Advisory only — the keyed wall above remains the number the engine reads. The
-              major positive GEX strike by open interest is the overhead analogue; it is an
+              major positive GEX level by open interest is the overhead analogue; it is an
               interpretation of Gexbot's series, which does not label either level a "wall".
+              Levels are shown exactly as published and never rounded to a strike — they are
+              not strikes.
               Fetched on demand and never by a scheduled job, because /majors draws on the
               small api_majors pool. Open interest is recomputed once daily at 08:30 ET, so
               refreshing more often than that returns the same figures for a spent request.

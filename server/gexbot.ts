@@ -7,7 +7,7 @@
 // (+676M) with 729 a minor strike in the trough (+157M), and the wall was re-keyed. The
 // proxy was not merely imprecise, it was wrong, because it read a single expiration and
 // ranked raw OI rather than gamma-weighted exposure across the chain. Gexbot publishes the
-// major positive and negative GEX strikes and the zero-gamma line directly, so the keyed
+// major positive and negative GEX levels and the zero-gamma line directly, so the keyed
 // wall can cite a provider number instead of an in-house approximation.
 //
 // THE CONSTRAINT THAT SHAPES EVERYTHING BELOW
@@ -78,9 +78,20 @@ export type GexbotTier = "classic" | "state" | "orderflow" | "unknown";
 export interface GexbotLevels {
   symbol: string;
   category: ClassicCategory;
-  /** Major POSITIVE gamma strike by open interest -- the overhead wall analogue. */
+  /**
+   * Major POSITIVE gamma LEVEL by open interest -- the overhead wall analogue.
+   *
+   * Not necessarily an exchange strike, despite the obvious reading of the field name. QQQ
+   * lists $1 increments, and the live value on 2026-09-20 was 720.02, so the provider is
+   * publishing an interpolated or weighted level rather than the single strike carrying the
+   * most gamma. Do not round it to a strike on that assumption.
+   */
   callWall: number | null;
-  /** Major NEGATIVE gamma strike by open interest -- the downside acceleration band. */
+  /**
+   * Major NEGATIVE gamma LEVEL by open interest -- the downside acceleration band. Came back
+   * as exactly 700.00 on 2026-09-20, which happens to be a strike, but the positive side was
+   * not -- so an integer here is a coincidence to distrust, not a guarantee.
+   */
   putWall: number | null;
   /** Zero-gamma line: the regime pivot. */
   gammaFlip: number | null;
@@ -287,7 +298,7 @@ async function request(path: string, timeoutMs: number): Promise<GexbotResult<un
  * Key levels for one symbol from the slim `/majors` route.
  *
  * Mapping note, stated plainly because it is interpretation rather than fact: Wingwall's
- * "wall" is an OVERHEAD level, so it maps to `mpos_oi`, the major positive-GEX strike by
+ * "wall" is an OVERHEAD level, so it maps to `mpos_oi`, the major positive-GEX level by
  * open interest. The open-interest series is preferred over the volume series (`mpos_vol`)
  * because OI reflects settled positioning that persists across sessions, which is what a
  * Monday-to-Thursday structure trades against; volume is intraday churn. Gexbot does not

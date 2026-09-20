@@ -165,11 +165,17 @@ CREATE TABLE IF NOT EXISTS gex_levels_cache (
   gamma_flip_status TEXT,
   regime TEXT,
   spot DOUBLE PRECISION,
-  -- DOUBLE PRECISION, not REAL. Net GEX is quoted in raw notional and runs to ten figures
-  -- (QQQ measured around 1.16e9 against a 1.36e10 gross). REAL is float4 with roughly seven
-  -- significant digits, so it silently rounded that to 1160076160 -- a corruption that never
-  -- throws and never looks wrong on a chart. The strike columns are only four digits and
-  -- would have survived REAL, but they are widened too so no future field inherits the trap.
+  -- DOUBLE PRECISION rather than REAL, but for a narrower reason than an earlier revision of
+  -- this comment claimed. That version said REAL was silently rounding net GEX from
+  -- 1160076199 to 1160076160; that figure came from a TEST FIXTURE built on QuantData's raw
+  -- notional scale, not from Gexbot. Live Gexbot returns a scaled value -- QQQ measured
+  -- 7771.88 on 2026-09-20 -- which REAL would have carried without loss. So the corruption
+  -- was never observed in production data and the claim was overstated.
+  --
+  -- The wider type is kept anyway: the provider does not document the scale or guarantee it,
+  -- a scaled quantity carries decimals that float4 does erode, and widening a float column
+  -- costs nothing here. Treat this as cheap insurance against an undocumented scale, not as
+  -- the fix for a bug that was ever hit.
   net_gex_oi DOUBLE PRECISION,
   provider_timestamp BIGINT,
   payload TEXT NOT NULL
