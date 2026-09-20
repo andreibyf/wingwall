@@ -75,7 +75,13 @@ CREATE TABLE IF NOT EXISTS settings (
   id INTEGER PRIMARY KEY,
   account_balance REAL NOT NULL DEFAULT 1000,
   risk_per_trade_percent REAL NOT NULL DEFAULT 10,
-  default_symbol TEXT NOT NULL DEFAULT 'QQQ'
+  default_symbol TEXT NOT NULL DEFAULT 'QQQ',
+  take_profit_mode TEXT NOT NULL DEFAULT 'multipleOfDebit',
+  take_profit_value REAL NOT NULL DEFAULT 2.0,
+  stop_loss_pct_of_max_loss REAL NOT NULL DEFAULT -0.4,
+  target_debit_to_width REAL NOT NULL DEFAULT 0.06,
+  max_debit_to_width REAL NOT NULL DEFAULT 0.15,
+  auto_trade_enabled BOOLEAN NOT NULL DEFAULT false
 );
 CREATE TABLE IF NOT EXISTS execution_checklist (
   id INTEGER PRIMARY KEY,
@@ -114,6 +120,22 @@ BEGIN
     ALTER TABLE flies ADD COLUMN peak_loss_pct REAL;
   END IF;
 END $$;
+`);
+
+  // Additive migration: exit policy and structure targeting moved out of code and into
+  // settings, so databases created before that change lack these columns. Every column is
+  // NOT NULL with a default matching the previous hardcoded behaviour except
+  // take_profit_mode, which deliberately defaults to the new debit-multiple policy -- the
+  // old percent-of-max-profit target was unreachable on this book's structures and could
+  // only ever fire the stop. Nothing is dropped, renamed or retyped, so this is safe to
+  // re-run and safe to roll back to the previous release, which simply ignores the columns.
+  await pool.query(`
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS take_profit_mode TEXT NOT NULL DEFAULT 'multipleOfDebit';
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS take_profit_value REAL NOT NULL DEFAULT 2.0;
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS stop_loss_pct_of_max_loss REAL NOT NULL DEFAULT -0.4;
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS target_debit_to_width REAL NOT NULL DEFAULT 0.06;
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS max_debit_to_width REAL NOT NULL DEFAULT 0.15;
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS auto_trade_enabled BOOLEAN NOT NULL DEFAULT false;
 `);
 }
 
