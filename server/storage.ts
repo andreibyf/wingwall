@@ -346,6 +346,7 @@ export interface IStorage {
   createCampaignWall(wall: InsertCampaignWall): Promise<CampaignWall>;
   updateCampaignWall(id: number, wall: Partial<InsertCampaignWall>): Promise<CampaignWall | undefined>;
   deleteCampaignWall(id: number): Promise<void>;
+  resolveCampaignWalls(keepId: number, duplicateIds: number[]): Promise<boolean>;
 
   getSettings(): Promise<Settings>;
   updateSettings(s: Partial<InsertSettings>): Promise<Settings>;
@@ -441,6 +442,39 @@ export class DatabaseStorage implements IStorage {
 
   async deleteCampaignWall(id: number): Promise<void> {
     await db.delete(campaignWalls).where(eq(campaignWalls.id, id));
+  }
+
+  async resolveCampaignWalls(keepId: number, duplicateIds: number[]): Promise<boolean> {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      // Serialize against inserts/updates so a stale review never removes unseen rows.
+      await client.query("LOCK TABLE campaign_walls IN SHARE ROW EXCLUSIVE MODE");
+      const kept = await client.query("SELECT * FROM campaign_walls WHERE id = $1", [keepId]);
+      if (!kept.rows.length) {
+        await client.query("ROLLBACK");
+        return false;
+      }
+      const wall = kept.rows[0];
+      const others = await client.query(
+        "SELECT id FROM campaign_walls WHERE symbol = $1 AND week_of = $2 AND id <> $3",
+        [wall.symbol, wall.week_of, keepId],
+      );
+      const actual = others.rows.map((r) => r.id as number);
+      if (actual.length !== duplicateIds.length || !actual.every((id) => duplicateIds.includes(id))) {
+        await client.query("ROLLBACK");
+        return false;
+      }
+      await client.query("UPDATE flies SET campaign_wall_id = $1 WHERE campaign_wall_id = ANY($2::int[])", [keepId, duplicateIds]);
+      await client.query("DELETE FROM campaign_walls WHERE id = ANY($1::int[])", [duplicateIds]);
+      await client.query("COMMIT");
+      return true;
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
   async getSettings(): Promise<Settings> {
