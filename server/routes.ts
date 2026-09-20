@@ -1,7 +1,23 @@
 import type { Express } from "express";
 import { createServer } from 'node:http';
 import type { Server } from 'node:http';
-import { storage } from "./storage";
+import {
+  storage,
+  getGexCallsToday,
+  recordGexCall,
+  getCachedLevels,
+  putCachedLevels,
+  etDateKey,
+} from "./storage";
+import {
+  getLevels as gexGetLevels,
+  resolveKey as gexResolveKey,
+  resolveTier as gexResolveTier,
+  isCovered as gexIsCovered,
+  isValidCategory as gexIsValidCategory,
+  DEFAULT_CATEGORY as GEX_DEFAULT_CATEGORY,
+  type ClassicCategory,
+} from "./gexbot";
 import {
   insertFlySchema,
   insertCampaignWallSchema,
@@ -388,6 +404,122 @@ export async function registerRoutes(
       const id = parseInt(req.params.id, 10);
       await storage.deleteCampaignWall(id);
       res.status(204).end();
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ---- Gexbot dealer positioning ------------------------------------------------
+  //
+  // Read-only status. Deliberately makes NO network call: this is what the Campaign page
+  // loads on mount, and /majors draws on the small api_majors pool. Everything here comes
+  // from the environment and the local cache.
+  app.get("/api/gexbot/status", async (_req, res, next) => {
+    try {
+      const { key, envName, prefixAdded } = gexResolveKey();
+      const settings = await storage.getSettings();
+      const symbol = settings.defaultSymbol;
+      const [callsToday, cached] = await Promise.all([
+        getGexCallsToday(),
+        getCachedLevels(symbol),
+      ]);
+      res.json({
+        configured: Boolean(key),
+        envVarName: envName,
+        // Surfaced so a key stored without the required gexbot_custom_ prefix is visible
+        // in the UI as a normalisation rather than showing up later as an opaque 401.
+        keyPrefixAdded: prefixAdded,
+        tier: gexResolveTier(),
+        symbol,
+        symbolCovered: gexIsCovered(symbol),
+        category: GEX_DEFAULT_CATEGORY,
+        callsToday,
+        quotaPool: "api_majors",
+        quotaResetsAt: "midnight ET",
+        etDate: etDateKey(),
+        refreshedDailyAt: "08:30 ET",
+        cached,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Explicit, operator-initiated refresh. Never call this from a scheduled job -- the exit
+  // watch alone fires eight times a session and would drain api_majors before the first
+  // hour closed. Spends exactly ONE request: Gexbot publishes no account endpoint, so there
+  // is no entitlement lookup to pay for, and coverage is checked locally before the call.
+  app.post("/api/gexbot/refresh", async (req, res, next) => {
+    try {
+      const settings = await storage.getSettings();
+      const symbol = String(req.body?.symbol ?? settings.defaultSymbol).toUpperCase();
+      if (!SUPPORTED_SYMBOLS.has(symbol)) {
+        return res.status(400).json({ message: `Unsupported symbol: ${symbol}` });
+      }
+
+      // Category is overridable so the operator can look at 0DTE/1DTE aggregations, but it
+      // is validated against the published set rather than passed through: the Gexbot web
+      // app uses different names in its URL hashes (90d, latest, next) and those are not
+      // API categories. Forwarding one would spend a request to earn a 400.
+      const rawCategory = req.body?.category;
+      let category: ClassicCategory = GEX_DEFAULT_CATEGORY;
+      if (rawCategory !== undefined && rawCategory !== null && rawCategory !== "") {
+        const c = String(rawCategory);
+        if (!gexIsValidCategory(c)) {
+          return res.status(400).json({ message: `Unsupported Gexbot category: ${c}` });
+        }
+        category = c;
+      }
+
+      const { key } = gexResolveKey();
+      if (!key) {
+        return res.status(200).json({
+          ok: false,
+          reason: "no_key",
+          detail: "No Gexbot key found in the server environment.",
+          callsToday: await getGexCallsToday(),
+        });
+      }
+
+      // Coverage guard before spending anything. A 404 from Gexbot cannot distinguish an
+      // uncarried ticker from a malformed path, so checking locally keeps the diagnosis
+      // honest and costs no quota.
+      if (!gexIsCovered(symbol)) {
+        return res.json({
+          ok: false,
+          reason: "not_covered",
+          detail:
+            `${symbol} is not in Gexbot's carried ticker set, so the request was not sent ` +
+            `and cost no api_majors quota.`,
+          tier: gexResolveTier(),
+          callsToday: await getGexCallsToday(),
+        });
+      }
+
+      const levels = await gexGetLevels(symbol, category);
+      // Recorded unconditionally on a sent request. A 429 or a 500 still consumed the
+      // attempt as far as the provider's counter is concerned, and a ledger that only
+      // counted successes would drift optimistic exactly when the budget is tightest.
+      await recordGexCall();
+      if (!levels.ok) {
+        return res.json({
+          ...levels,
+          tier: gexResolveTier(),
+          category,
+          callsToday: await getGexCallsToday(),
+        });
+      }
+
+      const fetchedAt = new Date().toISOString();
+      await putCachedLevels({ ...levels.value, category }, fetchedAt);
+
+      res.json({
+        ok: true,
+        tier: gexResolveTier(),
+        category,
+        callsToday: await getGexCallsToday(),
+        levels: { ...levels.value, raw: undefined, fetchedAt },
+      });
     } catch (err) {
       next(err);
     }

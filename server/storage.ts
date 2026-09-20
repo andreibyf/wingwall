@@ -137,6 +137,191 @@ ALTER TABLE settings ADD COLUMN IF NOT EXISTS target_debit_to_width REAL NOT NUL
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS max_debit_to_width REAL NOT NULL DEFAULT 0.15;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS auto_trade_enabled BOOLEAN NOT NULL DEFAULT false;
 `);
+
+  // Gexbot dealer-positioning cache and quota ledger.
+  //
+  // The cache is not a latency optimisation -- it is a quota guard. /majors draws on the
+  // api_majors pool, which Gexbot documents as SMALLER than api_default and which carries
+  // both a daily and a monthly ceiling. A page that refetched on mount would spend that
+  // budget on renders. Levels are fetched only on explicit operator action and read from
+  // here every other time.
+  //
+  // WHY THE LEDGER KEYS ON EASTERN TIME, NOT UTC
+  // Gexbot's quotas reset at midnight ET. An earlier draft of this table keyed on a UTC
+  // date because the provider it was originally written against reset at midnight UTC.
+  // Carrying that over would have put the local counter four or five hours out of step
+  // with the provider's every single evening: between 20:00 ET and midnight ET the UTC date
+  // has already rolled, so the ledger would report a fresh budget while Gexbot still
+  // counted the old day. That is precisely the window an operator checks levels in before
+  // the next session, so the disagreement would surface at the worst time.
+  await pool.query(`
+CREATE TABLE IF NOT EXISTS gex_levels_cache (
+  symbol TEXT PRIMARY KEY,
+  category TEXT,
+  fetched_at TEXT NOT NULL,
+  call_wall DOUBLE PRECISION,
+  put_wall DOUBLE PRECISION,
+  gamma_flip DOUBLE PRECISION,
+  gamma_flip_status TEXT,
+  regime TEXT,
+  spot DOUBLE PRECISION,
+  -- DOUBLE PRECISION, not REAL. Net GEX is quoted in raw notional and runs to ten figures
+  -- (QQQ measured around 1.16e9 against a 1.36e10 gross). REAL is float4 with roughly seven
+  -- significant digits, so it silently rounded that to 1160076160 -- a corruption that never
+  -- throws and never looks wrong on a chart. The strike columns are only four digits and
+  -- would have survived REAL, but they are widened too so no future field inherits the trap.
+  net_gex_oi DOUBLE PRECISION,
+  provider_timestamp BIGINT,
+  payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS gex_usage (
+  et_date TEXT PRIMARY KEY,
+  calls INTEGER NOT NULL DEFAULT 0
+);
+`);
+
+  // Applied additively so a database created by an earlier revision of this file picks the
+  // columns up without a destructive migration, matching how the settings columns above are
+  // handled. Render's Postgres is not reachable from a development sandbox, so every
+  // migration has to be safe to run unattended at boot.
+  await pool.query(`
+ALTER TABLE gex_levels_cache ADD COLUMN IF NOT EXISTS category TEXT;
+ALTER TABLE gex_levels_cache ADD COLUMN IF NOT EXISTS spot DOUBLE PRECISION;
+ALTER TABLE gex_levels_cache ADD COLUMN IF NOT EXISTS net_gex_oi DOUBLE PRECISION;
+ALTER TABLE gex_levels_cache ADD COLUMN IF NOT EXISTS provider_timestamp BIGINT;
+-- Widen in place for any database that already took these columns as REAL. ALTER TYPE to a
+-- wider float is a no-op when the type already matches, so this is safe to re-run at every
+-- boot; it cannot recover precision already lost, but the cache is refetchable by design.
+ALTER TABLE gex_levels_cache ALTER COLUMN call_wall TYPE DOUBLE PRECISION;
+ALTER TABLE gex_levels_cache ALTER COLUMN put_wall TYPE DOUBLE PRECISION;
+ALTER TABLE gex_levels_cache ALTER COLUMN gamma_flip TYPE DOUBLE PRECISION;
+ALTER TABLE gex_levels_cache ALTER COLUMN spot TYPE DOUBLE PRECISION;
+ALTER TABLE gex_levels_cache ALTER COLUMN net_gex_oi TYPE DOUBLE PRECISION;
+`);
+}
+
+/**
+ * Eastern-time day key -- matches Gexbot's midnight-ET quota reset, not the server's UTC
+ * day and not the operator's device clock. Uses the IANA zone so the switch in and out of
+ * daylight saving is handled by the runtime rather than by an offset constant that would
+ * silently rot in November.
+ */
+export function etDateKey(now: Date = new Date()): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(now);
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+export async function getGexCallsToday(now: Date = new Date()): Promise<number> {
+  const r = await pool.query(
+    `SELECT calls FROM gex_usage WHERE et_date = $1`,
+    [etDateKey(now)],
+  );
+  return r.rows.length ? Number(r.rows[0].calls) : 0;
+}
+
+export async function recordGexCall(now: Date = new Date()): Promise<number> {
+  const r = await pool.query(
+    `INSERT INTO gex_usage (et_date, calls) VALUES ($1, 1)
+     ON CONFLICT (et_date) DO UPDATE SET calls = gex_usage.calls + 1
+     RETURNING calls`,
+    [etDateKey(now)],
+  );
+  return Number(r.rows[0].calls);
+}
+
+export interface CachedLevels {
+  symbol: string;
+  category: string | null;
+  fetchedAt: string;
+  callWall: number | null;
+  putWall: number | null;
+  gammaFlip: number | null;
+  gammaFlipStatus: string | null;
+  regime: string | null;
+  spot: number | null;
+  netGexOi: number | null;
+  providerTimestamp: number | null;
+}
+
+export async function getCachedLevels(symbol: string): Promise<CachedLevels | null> {
+  const r = await pool.query(
+    `SELECT symbol, category, fetched_at, call_wall, put_wall, gamma_flip,
+            gamma_flip_status, regime, spot, net_gex_oi, provider_timestamp
+       FROM gex_levels_cache WHERE symbol = $1`,
+    [symbol.toUpperCase()],
+  );
+  if (!r.rows.length) return null;
+  const row = r.rows[0];
+  const num = (v: unknown) => (v === null || v === undefined ? null : Number(v));
+  return {
+    symbol: row.symbol,
+    category: row.category ?? null,
+    fetchedAt: row.fetched_at,
+    callWall: num(row.call_wall),
+    putWall: num(row.put_wall),
+    gammaFlip: num(row.gamma_flip),
+    gammaFlipStatus: row.gamma_flip_status ?? null,
+    regime: row.regime ?? null,
+    spot: num(row.spot),
+    netGexOi: num(row.net_gex_oi),
+    providerTimestamp: num(row.provider_timestamp),
+  };
+}
+
+export async function putCachedLevels(
+  levels: {
+    symbol: string;
+    category?: string | null;
+    callWall: number | null;
+    putWall: number | null;
+    gammaFlip: number | null;
+    gammaFlipStatus: string | null;
+    regime: string | null;
+    spot?: number | null;
+    netGexOi?: number | null;
+    providerTimestamp?: number | null;
+    raw: unknown;
+  },
+  fetchedAt: string,
+): Promise<void> {
+  await pool.query(
+    `INSERT INTO gex_levels_cache
+       (symbol, category, fetched_at, call_wall, put_wall, gamma_flip, gamma_flip_status,
+        regime, spot, net_gex_oi, provider_timestamp, payload)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+     ON CONFLICT (symbol) DO UPDATE SET
+       category = EXCLUDED.category,
+       fetched_at = EXCLUDED.fetched_at,
+       call_wall = EXCLUDED.call_wall,
+       put_wall = EXCLUDED.put_wall,
+       gamma_flip = EXCLUDED.gamma_flip,
+       gamma_flip_status = EXCLUDED.gamma_flip_status,
+       regime = EXCLUDED.regime,
+       spot = EXCLUDED.spot,
+       net_gex_oi = EXCLUDED.net_gex_oi,
+       provider_timestamp = EXCLUDED.provider_timestamp,
+       payload = EXCLUDED.payload`,
+    [
+      levels.symbol.toUpperCase(),
+      levels.category ?? null,
+      fetchedAt,
+      levels.callWall,
+      levels.putWall,
+      levels.gammaFlip,
+      levels.gammaFlipStatus,
+      levels.regime,
+      levels.spot ?? null,
+      levels.netGexOi ?? null,
+      levels.providerTimestamp ?? null,
+      JSON.stringify(levels.raw ?? null),
+    ],
+  );
 }
 
 export interface IStorage {
