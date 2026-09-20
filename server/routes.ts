@@ -554,9 +554,22 @@ export async function registerRoutes(
     }
   });
 
+  // Upsert on (symbol, weekOf) rather than a blind insert.
+  //
+  // A week can only have one wall, but nothing enforced that, so re-keying through this endpoint
+  // -- or a retried request -- left two rows for the same week and the readers silently picked
+  // one. Done in application code rather than ON CONFLICT because the unique index is skipped
+  // when pre-existing duplicates are present, and this path has to behave identically either way.
   app.post("/api/campaign", async (req, res, next) => {
     try {
       const parsed = insertCampaignWallSchema.parse(req.body);
+      const existing = await storage.findCampaignWallForWeek(parsed.symbol, parsed.weekOf);
+      if (existing) {
+        const updated = await storage.updateCampaignWall(existing.id, parsed);
+        // 200, not 201: nothing was created. A client that distinguishes the two should see the
+        // difference rather than be told it made a new row.
+        return res.status(200).json(updated);
+      }
       res.status(201).json(await storage.createCampaignWall(parsed));
     } catch (err) {
       next(err);

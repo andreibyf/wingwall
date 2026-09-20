@@ -15,7 +15,7 @@ import type {
 } from '@shared/schema';
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { eq, desc } from "drizzle-orm";
+import { eq, desc, and } from "drizzle-orm";
 
 if (!process.env.DATABASE_URL) {
   throw new Error("DATABASE_URL is required (Render Postgres connection string)");
@@ -120,6 +120,42 @@ CREATE TABLE IF NOT EXISTS journal_notes (
   created_at TEXT NOT NULL
 );
 `);
+
+  // Uniqueness for campaign walls on (symbol, week_of).
+  //
+  // Nothing enforced this, so a POST could insert a second wall for a week the operator had
+  // already keyed, and the readers then silently picked one of them. The route now updates in
+  // place instead of inserting, but the constraint is what makes the duplicate structurally
+  // impossible rather than merely unlikely.
+  //
+  // Created defensively. CREATE UNIQUE INDEX fails outright if duplicates already exist, and
+  // this runs at boot -- so an unguarded attempt would turn pre-existing duplicate rows into a
+  // service that will not start. The duplicates are checked FIRST, and if any are present the
+  // index is skipped and the conflict is logged loudly. Deliberately no automatic cleanup: the
+  // rows may carry notes, and choosing which to discard is the operator's call, not a
+  // migration's.
+  {
+    const dupes = await pool.query(`
+      SELECT symbol, week_of, COUNT(*) AS n, ARRAY_AGG(id ORDER BY id) AS ids
+        FROM campaign_walls
+    GROUP BY symbol, week_of
+      HAVING COUNT(*) > 1
+    `);
+    if (dupes.rows.length > 0) {
+      for (const r of dupes.rows) {
+        console.warn(
+          `[schema] campaign_walls has ${r.n} rows for ${r.symbol} week_of ${r.week_of} ` +
+            `(ids ${(r.ids as number[]).join(", ")}). The app uses the highest id and flags the ` +
+            `rest in the UI. Uniqueness NOT enforced until these are resolved by hand.`
+        );
+      }
+    } else {
+      await pool.query(
+        `CREATE UNIQUE INDEX IF NOT EXISTS campaign_walls_symbol_week_uniq
+           ON campaign_walls (symbol, week_of)`
+      );
+    }
+  }
 
   // Additive migration: decision capture and review storage.
   //
@@ -390,6 +426,7 @@ export interface IStorage {
 
   listCampaignWalls(): Promise<CampaignWall[]>;
   getCampaignWall(id: number): Promise<CampaignWall | undefined>;
+  findCampaignWallForWeek(symbol: string, weekOf: string): Promise<CampaignWall | undefined>;
   createCampaignWall(wall: InsertCampaignWall): Promise<CampaignWall>;
   updateCampaignWall(id: number, wall: Partial<InsertCampaignWall>): Promise<CampaignWall | undefined>;
   deleteCampaignWall(id: number): Promise<void>;
@@ -527,6 +564,22 @@ export class DatabaseStorage implements IStorage {
 
   async getCampaignWall(id: number): Promise<CampaignWall | undefined> {
     const rows = await db.select().from(campaignWalls).where(eq(campaignWalls.id, id));
+    return rows[0];
+  }
+
+  /**
+   * The wall for a symbol and week, newest first. Mirrors the client's selectWallForWeek so the
+   * server's idea of "the" wall for a week cannot diverge from what the UI shows.
+   */
+  async findCampaignWallForWeek(
+    symbol: string,
+    weekOf: string
+  ): Promise<CampaignWall | undefined> {
+    const rows = await db
+      .select()
+      .from(campaignWalls)
+      .where(and(eq(campaignWalls.symbol, symbol), eq(campaignWalls.weekOf, weekOf)))
+      .orderBy(desc(campaignWalls.id));
     return rows[0];
   }
 

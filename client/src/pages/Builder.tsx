@@ -5,6 +5,7 @@ import { computeFlyPricing, deriveFlyEconomics, getMultiplier, buildPayoffCurve 
 // the Builder could warn about a mismatch the review does not flag, or stay silent on one it does.
 import { expectedSideForBranch } from "@shared/learning";
 import { fmtUsd, fmtNum, todayIso, weekOfMonday } from "@/lib/format";
+import { selectWallForWeek } from "@/lib/walls";
 import { PayoffChart } from "@/components/app/PayoffChart";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
@@ -44,11 +45,11 @@ export default function Builder() {
   const createFly = useCreateFly();
   const { data: walls } = useCampaignWalls();
 
-  // The wall for THIS week and THIS symbol. Same selector Campaign.tsx uses, so the Builder can
-  // never show a branch the Campaign page disagrees with.
+  // The wall for THIS week and THIS symbol, through the one shared selector Campaign.tsx also
+  // uses, so the Builder can never stamp a branch the Campaign page disagrees with.
   const weekOf = weekOfMonday();
-  const activeWall = useMemo(
-    () => (walls ?? []).find((w) => w.symbol === symbol && w.weekOf === weekOf),
+  const { wall: activeWall, duplicates: wallDuplicates } = useMemo(
+    () => selectWallForWeek(walls, symbol, weekOf),
     [walls, symbol, weekOf]
   );
   const keyedBranch = activeWall?.activeBranch ?? null;
@@ -412,6 +413,18 @@ export default function Builder() {
                 <span className="text-right tabular-nums" data-testid="text-thesis-spot">
                   {liveSpot !== null ? fmtUsd(liveSpot) : "not recorded"}
                 </span>
+              </div>
+            )}
+
+            {wallDuplicates.length > 0 && (
+              <div
+                className="rounded-md border border-chart-3/40 bg-chart-3/10 px-2.5 py-2 text-xs text-chart-3"
+                data-testid="warning-thesis-duplicate-walls"
+              >
+                {wallDuplicates.length + 1} walls exist for {symbol} this week. Using the most
+                recent (id {activeWall?.id}); ignoring id{wallDuplicates.length > 1 ? "s" : ""}{" "}
+                {wallDuplicates.map((w) => w.id).join(", ")}. Resolve them on the Campaign page so
+                the trade is stamped with the wall you mean.
               </div>
             )}
 
