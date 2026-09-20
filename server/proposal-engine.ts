@@ -75,6 +75,11 @@ export const MAX_SLIPPAGE_MULTIPLE = 2.5;
  */
 export const MAX_CONTRACTS = 10;
 
+// A thin target expiration still fills, but the wing quotes are wide and a bigger lot
+// multiplies that slippage on both entry and exit. The user's rule for a thin week is to
+// keep the cadence and hold the lot small rather than take the full budget's worth.
+export const THIN_EXPIRATION_MAX_CONTRACTS = 2;
+
 export interface FlyProposal {
   viable: boolean;
   reason: string | null;
@@ -123,6 +128,8 @@ export interface FlyProposal {
 export type BodyPreference = "gammaPeak" | "offsetBelowOpen";
 
 export interface BranchPolicy {
+  /** Breaks only: the body must sit strictly above the keyed wall, not merely above spot. */
+  requiresBodyAboveWall: boolean;
   optionType: "call" | "put" | null;
   bodyPreference: BodyPreference;
   /** Fractional offset from the reference open, used only by the grinds branch. */
@@ -138,6 +145,7 @@ export function branchPolicy(branch: string): BranchPolicy {
   const b = (branch || "").toLowerCase();
   if (b === "rejects") {
     return {
+      requiresBodyAboveWall: false,
       optionType: "put",
       bodyPreference: "gammaPeak",
       offsetFromOpen: null,
@@ -147,6 +155,7 @@ export function branchPolicy(branch: string): BranchPolicy {
   }
   if (b === "grinds") {
     return {
+      requiresBodyAboveWall: false,
       optionType: "put",
       bodyPreference: "offsetBelowOpen",
       offsetFromOpen: GRINDS_BODY_OFFSET,
@@ -158,6 +167,7 @@ export function branchPolicy(branch: string): BranchPolicy {
   }
   if (b === "breaks") {
     return {
+      requiresBodyAboveWall: true,
       optionType: "call",
       bodyPreference: "gammaPeak",
       offsetFromOpen: null,
@@ -169,6 +179,7 @@ export function branchPolicy(branch: string): BranchPolicy {
     };
   }
   return {
+    requiresBodyAboveWall: false,
     optionType: null,
     bodyPreference: "gammaPeak",
     offsetFromOpen: null,
@@ -218,7 +229,10 @@ export function buildProposal(
   branch: BranchPolicy,
   settings: ProposalSettings,
   policy: ExitPolicy,
-  referenceOpen?: number | null
+  referenceOpen?: number | null,
+  // The keyed wall price. Required to place a breaks body correctly: without it the engine
+  // can only ask "is this above spot", which on a break thesis is not the same question.
+  wallPrice?: number | null
 ): FlyProposal {
   const asOf = analysis.asOf ?? new Date().toISOString();
   const symbol = analysis.symbol ?? "";
@@ -364,6 +378,63 @@ export function buildProposal(
       return onRightSide;
     });
 
+    // On breaks the thesis is that price pushes THROUGH the wall and keeps going, so the
+    // tent has to sit above the wall. Filtering on spot alone is not enough: a body at or
+    // just under the wall pays maximally when price pins at the level, which is the stall
+    // case the breaks branch exists to rule out. Only breaks needs this -- rejects and
+    // grinds place bodies below spot, away from an overhead wall, so the wall is not a
+    // binding constraint there.
+    const wallFiltered =
+      branch.requiresBodyAboveWall && wallPrice != null && wallPrice > 0
+        ? sideFiltered.filter((c) => {
+            if (c.strike <= wallPrice) {
+              rejectedBodies.push({
+                strike: c.strike,
+                reason:
+                  `at or below the keyed wall ${wallPrice}; a breaks body must sit above the ` +
+                  `wall, otherwise the structure pays most when price stalls at the level ` +
+                  `instead of breaking through it`,
+              });
+              return false;
+            }
+            return true;
+          })
+        : sideFiltered;
+
+    if (branch.requiresBodyAboveWall && (wallPrice == null || wallPrice <= 0)) {
+      return {
+        ...emptyProposal(
+          `The breaks branch needs the keyed wall price to place the body above the wall, and ` +
+            `no usable wall price was supplied. Standing down rather than centring the tent on ` +
+            `an unknown level.`,
+          asOf,
+          symbol,
+          spot,
+          riskBudget
+        ),
+        optionType,
+        expiration,
+        rejectedBodies,
+      };
+    }
+
+    if (!wallFiltered.length && sideFiltered.length) {
+      return {
+        ...emptyProposal(
+          `No qualifying body above the keyed wall ${wallPrice} for a ${optionType} fly. ` +
+            `${sideFiltered.length} candidate${sideFiltered.length === 1 ? "" : "s"} sat above spot ` +
+            `${spot} but at or below the wall, which is the stall case rather than a break.`,
+          asOf,
+          symbol,
+          spot,
+          riskBudget
+        ),
+        optionType,
+        expiration,
+        rejectedBodies,
+      };
+    }
+
     if (!sideFiltered.length) {
       return {
         ...emptyProposal(
@@ -384,7 +455,7 @@ export function buildProposal(
     // interest -- the largest-gamma lens, which is the pinning force the structure is
     // betting on. Ranking by raw OI instead would favour a far strike with heavy aggregate
     // interest and no gamma.
-    const body = sideFiltered
+    const body = wallFiltered
       .slice()
       .sort((a, b) => (gammaRank.get(b.strike) ?? 0) - (gammaRank.get(a.strike) ?? 0))[0];
     bodyStrike = body.strike;
@@ -393,7 +464,11 @@ export function buildProposal(
       `Body at ${bodyStrike}: highest gamma-weighted open interest` +
       (bodyGamma == null ? "" : ` (${bodyGamma})`) +
       ` among strikes inside the two-expected-move limit and on the correct side of spot ` +
-      `${spot} for a ${optionType} fly. ${body.expectedMovesFromSpot} expected moves away. ${branch.note}`;
+      `${spot} for a ${optionType} fly` +
+      (branch.requiresBodyAboveWall && wallPrice != null
+        ? `, and above the keyed wall ${wallPrice}`
+        : "") +
+      `. ${body.expectedMovesFromSpot} expected moves away. ${branch.note}`;
   }
 
   // --- Wings ----------------------------------------------------------------
@@ -538,7 +613,10 @@ export function buildProposal(
   // --- Size -----------------------------------------------------------------
   const multiplier = getMultiplier(symbol);
   const perContractRisk = chosen.debit * multiplier;
-  const contracts = Math.min(Math.floor(riskBudget / perContractRisk), MAX_CONTRACTS);
+  const isThinExpiration = analysis.liquidity?.isThin === true;
+  const lotCeiling = isThinExpiration ? THIN_EXPIRATION_MAX_CONTRACTS : MAX_CONTRACTS;
+  const budgetContracts = Math.floor(riskBudget / perContractRisk);
+  const contracts = Math.min(budgetContracts, lotCeiling);
   if (contracts < 1) {
     return {
       ...emptyProposal(
@@ -606,8 +684,15 @@ export function buildProposal(
       `= $${round2(econ.maxLoss)} of the $${riskBudget} budget ` +
       `(${settings.riskPerTradePercent}% of $${settings.accountBalance}). ` +
       `Capital deployed equals max loss.` +
-      (Math.floor(riskBudget / perContractRisk) > MAX_CONTRACTS
-        ? ` Budget allowed ${Math.floor(riskBudget / perContractRisk)} contracts but the lot is capped at ${MAX_CONTRACTS}.`
+      (budgetContracts > lotCeiling
+        ? ` Budget allowed ${budgetContracts} contracts but the lot is capped at ${lotCeiling}` +
+          (isThinExpiration
+            ? `, because the target expiration is thin (${analysis.liquidity?.putOpenInterest} put OI, ` +
+              `${Math.round((analysis.liquidity?.targetShareOfDeepest ?? 0) * 100)}% of ` +
+              `${analysis.liquidity?.deepestNearbyExpiration}) and a bigger lot multiplies the wide-quote ` +
+              `slippage on both entry and exit`
+            : ``) +
+          `.`
         : ""),
     consideredWings: considered,
     rejectedBodies,

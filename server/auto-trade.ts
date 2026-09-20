@@ -251,6 +251,9 @@ export async function runAutoTrade(
     },
     exitPolicy,
     newestWall?.referenceClose ?? null,
+    // Only read when the branch is breaks, but passed unconditionally so the engine -- not
+    // this caller -- decides when the wall is a binding constraint.
+    newestWall?.wallPrice ?? null,
   );
   base.proposal = proposal;
 
