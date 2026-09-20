@@ -93,7 +93,10 @@ const r2 = (n: number) => Math.round(n * 100) / 100;
 export const GRINDS_BODY_OFFSET_EXPECTED = -0.02;
 
 /** Branch -> the side the playbook expects. breaks is the only bull branch. */
-export function expectedSideForBranch(branch: string): "call" | "put" | null {
+// Accepts null so callers holding an unrecorded branch need no separate guard: an absent branch
+// and an unrecognised one both mean "no side is expected", which is not the same as expecting a
+// mismatch. Callers must treat null as "do not warn", never as "warn".
+export function expectedSideForBranch(branch: string | null): "call" | "put" | null {
   if (branch === "breaks") return "call";
   if (branch === "rejects" || branch === "grinds") return "put";
   return null;
