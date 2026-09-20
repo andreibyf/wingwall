@@ -409,6 +409,32 @@ export async function registerRoutes(
     }
   });
 
+  // Collapse a duplicated (symbol, weekOf) to the single row the operator chose to keep.
+  //
+  // This exists as one server call instead of the client issuing N DELETEs because the
+  // deletion has to carry the flies that referenced the discarded rows with it, and because
+  // a half-applied cleanup is worse than the duplication (see storage.ts). The client sends
+  // the group it believes it is resolving; the server re-reads that group and only ever
+  // deletes rows matching BOTH the symbol and the week, so a wrong or stale id cannot reach
+  // an unrelated week's wall.
+  const resolveDuplicateWallsSchema = z.object({
+    symbol: z.string().min(1),
+    weekOf: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "weekOf must be a YYYY-MM-DD Monday"),
+    keepId: z.number().int().positive(),
+  });
+
+  app.post("/api/campaign/resolve-duplicates", async (req, res, next) => {
+    try {
+      const { symbol, weekOf, keepId } = resolveDuplicateWallsSchema.parse(req.body);
+      const result = await storage.resolveDuplicateCampaignWalls(symbol, weekOf, keepId);
+      // A stale keeper is a 409, not a 500: the request was well formed, the world moved.
+      if (!result.ok) return res.status(409).json(result);
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  });
+
   // ---- Gexbot dealer positioning ------------------------------------------------
   //
   // Read-only status. Deliberately makes NO network call: this is what the Campaign page

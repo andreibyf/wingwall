@@ -226,6 +226,30 @@ export function useUpdateCampaignWall() {
   });
 }
 
+// Collapse a duplicated symbol + week to one row. Invalidates flies as well as walls: the
+// server repoints any fly that referenced a discarded row, so a stale flies cache would show
+// the old campaign attribution.
+export type ResolveDuplicateWallsResponse = {
+  ok: true;
+  kept: CampaignWall;
+  deletedIds: number[];
+  fliesRepointed: number;
+};
+
+export function useResolveDuplicateWalls() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: { symbol: string; weekOf: string; keepId: number }) => {
+      const res = await apiRequest("POST", "/api/campaign/resolve-duplicates", vars);
+      return (await res.json()) as ResolveDuplicateWallsResponse;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["/api/campaign"] });
+      qc.invalidateQueries({ queryKey: ["/api/flies"] });
+    },
+  });
+}
+
 export function useDeleteCampaignWall() {
   const qc = useQueryClient();
   return useMutation({

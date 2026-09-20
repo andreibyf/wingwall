@@ -5,11 +5,24 @@ import {
   useCampaignWalls,
   useCreateCampaignWall,
   useUpdateCampaignWall,
+  useResolveDuplicateWalls,
   useFlies,
   useChecklist,
   useUpdateChecklist,
 } from "@/lib/hooks";
 import { fmtUsd, fmtPct, weekOfMonday } from "@/lib/format";
+import { canonicalWall, duplicateWallGroups } from "@shared/wall-selection";
+import type { CampaignWall } from "@shared/schema";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -207,10 +220,29 @@ export default function Campaign() {
     return { blocked: false, reason: null, gap: level - spot };
   }, [gexLevels]);
 
+  // The row this form edits. Resolved with the shared canonical rule (highest id for the
+  // symbol + week) rather than `find()` over the created_at-ordered list, so the form always
+  // edits the same row the proposal engine and the copilot read. Those two used to be able to
+  // disagree, which meant a branch change could appear saved while the engine traded another
+  // row's branch.
   const existing = useMemo(
-    () => (walls ?? []).find((w) => w.symbol === symbol && w.weekOf === weekOf),
+    () => canonicalWall(walls ?? [], symbol, weekOf),
     [walls, symbol, weekOf]
   );
+
+  // Duplicated symbol + week groups anywhere in the book, current week first. Empty in the
+  // normal case, and the panel below renders nothing then -- a permanent "no duplicates"
+  // banner would just train the operator to ignore the spot where the warning appears.
+  const dupGroups = useMemo(() => {
+    const groups = duplicateWallGroups(walls ?? []);
+    return groups.sort((a, b) => {
+      const aCurrent = a.symbol === symbol && a.weekOf === weekOf ? 0 : 1;
+      const bCurrent = b.symbol === symbol && b.weekOf === weekOf ? 0 : 1;
+      return aCurrent - bCurrent;
+    });
+  }, [walls, symbol, weekOf]);
+
+  const currentWeekDuped = dupGroups.some((g) => g.symbol === symbol && g.weekOf === weekOf);
 
   const [wallPrice, setWallPrice] = useState("");
   const [referenceClose, setReferenceClose] = useState("");
@@ -286,6 +318,58 @@ export default function Campaign() {
     }
   };
 
+  // --- Duplicate resolution -------------------------------------------------------------
+  //
+  // The action is deliberately "keep this one" rather than "delete that one": the operator is
+  // choosing which wall governs the week, which is the decision they actually hold, and it
+  // makes it impossible to click your way to zero walls for an open week.
+  const resolveDuplicates = useResolveDuplicateWalls();
+  const [pendingKeep, setPendingKeep] = useState<{
+    symbol: string;
+    weekOf: string;
+    keep: CampaignWall;
+    discard: CampaignWall[];
+  } | null>(null);
+
+  // Flies are shown per row before anything is deleted, because a wall with logged fills
+  // against it is not interchangeable with an empty duplicate -- the operator should see
+  // which row the week was actually traded under.
+  const flyCountByWall = useMemo(() => {
+    const counts = new Map<number, number>();
+    (flies ?? []).forEach((f) => {
+      if (f.campaignWallId === null || f.campaignWallId === undefined) return;
+      counts.set(f.campaignWallId, (counts.get(f.campaignWallId) ?? 0) + 1);
+    });
+    return counts;
+  }, [flies]);
+
+  const handleConfirmResolve = async () => {
+    if (!pendingKeep) return;
+    const { symbol: s, weekOf: w, keep } = pendingKeep;
+    try {
+      const result = await resolveDuplicates.mutateAsync({ symbol: s, weekOf: w, keepId: keep.id });
+      const movedNote =
+        result.fliesRepointed > 0
+          ? ` ${result.fliesRepointed} logged fl${result.fliesRepointed === 1 ? "y" : "ies"} reattached to it.`
+          : "";
+      toast({
+        title:
+          result.deletedIds.length === 0
+            ? "Already resolved"
+            : `Kept wall #${result.kept.id}, removed ${result.deletedIds.length}`,
+        description:
+          result.deletedIds.length === 0
+            ? `${s} · week of ${w} now has a single wall.`
+            : `${s} · week of ${w} · discarded #${result.deletedIds.join(", #")}.${movedNote}`,
+      });
+      setPendingKeep(null);
+    } catch (e: any) {
+      // Includes the 409 when the chosen row vanished under a second tab. Left open on
+      // purpose so the refreshed list can be re-read and a different row chosen.
+      toast({ title: "Could not resolve duplicates", description: e?.message, variant: "destructive" });
+    }
+  };
+
   const handleChecklistToggle = (key: keyof ChecklistPatch, value: boolean) => {
     updateChecklist.mutate({ [key]: value });
   };
@@ -306,7 +390,161 @@ export default function Campaign() {
         <Badge variant="outline" className="font-mono">Week of {weekOf}</Badge>
         {isThursday && <Badge className="bg-chart-4 text-white">Thursday — deploy reserve after expiry crush</Badge>}
         {isFridayAfternoon && <Badge variant="destructive">Friday curfew — exits only</Badge>}
+        {currentWeekDuped && (
+          <Badge variant="destructive" data-testid="badge-duplicate-wall">
+            Duplicate wall keyed for this week
+          </Badge>
+        )}
       </div>
+
+      {/* Duplicate walls ------------------------------------------------------------------
+          Rendered only when there is something to fix, and above the keying form because
+          editing a duplicated week is the thing that misleads: the form writes to the
+          canonical row while the shadowed rows stay in the book, so the operator should
+          collapse the week before touching the branch. */}
+      {dupGroups.length > 0 && (
+        <div
+          className="flex flex-col gap-4 rounded-lg border border-destructive/50 bg-destructive/5 p-4"
+          data-testid="panel-duplicate-walls"
+        >
+          <div>
+            <h2 className="text-sm font-semibold text-destructive">
+              {dupGroups.length} week{dupGroups.length === 1 ? "" : "s"} keyed more than once
+            </h2>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+              A symbol and week should hold exactly one wall. Where there is more than one, the
+              engine, the copilot and this page all read the newest row (highest id) and ignore
+              the rest — so a branch or price stored on a shadowed row is live in the database and
+              dead to every reader. Keep the row that actually governs the week; the others are
+              deleted and any fills logged against them are reattached to the row you keep.
+            </p>
+          </div>
+
+          {dupGroups.map((group) => (
+            <div
+              key={`${group.symbol}-${group.weekOf}`}
+              className="rounded-md border border-border bg-background p-3"
+              data-testid={`dup-group-${group.symbol}-${group.weekOf}`}
+            >
+              <div className="mb-2 flex flex-wrap items-center gap-2">
+                <span className="text-sm font-semibold">{group.symbol}</span>
+                <Badge variant="outline" className="font-mono text-[10px]">week of {group.weekOf}</Badge>
+                <Badge variant="outline" className="text-[10px]">{group.rows.length} rows</Badge>
+                {group.symbol === symbol && group.weekOf === weekOf && (
+                  <Badge className="bg-chart-4 text-[10px] text-white">Current selection</Badge>
+                )}
+              </div>
+
+              <div className="flex flex-col gap-2">
+                {group.rows.map((row) => {
+                  const isCanonical = row.id === group.canonical.id;
+                  const flyCount = flyCountByWall.get(row.id) ?? 0;
+                  return (
+                    <div
+                      key={row.id}
+                      className="flex flex-wrap items-center justify-between gap-2 rounded border border-border p-2"
+                      data-testid={`dup-row-${row.id}`}
+                    >
+                      <div className="flex flex-col gap-0.5">
+                        <div className="flex flex-wrap items-center gap-2 text-sm">
+                          <span className="font-mono text-xs text-muted-foreground">#{row.id}</span>
+                          <span className="font-mono">{fmtUsd(row.wallPrice)}</span>
+                          <Badge variant="outline" className="text-[10px]">{row.activeBranch}</Badge>
+                          {row.reKeyed && (
+                            <Badge variant="outline" className="text-[10px]">re-keyed</Badge>
+                          )}
+                          {isCanonical ? (
+                            <Badge className="bg-chart-2 text-[10px] text-white">Engine reads this</Badge>
+                          ) : (
+                            <Badge variant="destructive" className="text-[10px]">Ignored</Badge>
+                          )}
+                        </div>
+                        <div className="text-[10px] text-muted-foreground">
+                          Ref close {fmtUsd(row.referenceClose)} · gap{" "}
+                          {row.gapPercent === null ? "—" : fmtPct(row.gapPercent, 2)} · created{" "}
+                          {new Date(row.createdAt).toLocaleString()} ·{" "}
+                          {flyCount === 0 ? "no fills logged" : `${flyCount} fill${flyCount === 1 ? "" : "s"} logged`}
+                        </div>
+                        {row.notes && (
+                          <div className="max-w-prose text-[10px] italic text-muted-foreground">{row.notes}</div>
+                        )}
+                      </div>
+                      <Button
+                        size="sm"
+                        variant={isCanonical ? "default" : "outline"}
+                        disabled={resolveDuplicates.isPending}
+                        onClick={() =>
+                          setPendingKeep({
+                            symbol: group.symbol,
+                            weekOf: group.weekOf,
+                            keep: row,
+                            discard: group.rows.filter((r) => r.id !== row.id),
+                          })
+                        }
+                        data-testid={`button-keep-wall-${row.id}`}
+                      >
+                        Keep this one
+                      </Button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Irreversible and it removes rows the operator may have typed by hand, so the exact
+          rows being discarded — and any fills that move with them — are named before the
+          delete, not summarised as a count. */}
+      <AlertDialog open={pendingKeep !== null} onOpenChange={(open) => !open && setPendingKeep(null)}>
+        <AlertDialogContent data-testid="dialog-resolve-duplicates">
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Keep wall #{pendingKeep?.keep.id} for {pendingKeep?.symbol} week of {pendingKeep?.weekOf}?
+            </AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="flex flex-col gap-2 text-left">
+                <p>
+                  Wall #{pendingKeep?.keep.id} at{" "}
+                  <span className="font-mono">{fmtUsd(pendingKeep?.keep.wallPrice)}</span> on branch{" "}
+                  <span className="font-mono">{pendingKeep?.keep.activeBranch}</span> becomes the only
+                  wall for that week.
+                </p>
+                <p>These rows are deleted permanently:</p>
+                <ul className="flex flex-col gap-1">
+                  {(pendingKeep?.discard ?? []).map((row) => {
+                    const flyCount = flyCountByWall.get(row.id) ?? 0;
+                    return (
+                      <li key={row.id} className="font-mono text-xs">
+                        #{row.id} · {fmtUsd(row.wallPrice)} · {row.activeBranch}
+                        {flyCount > 0
+                          ? ` · ${flyCount} fill${flyCount === 1 ? "" : "s"} move to #${pendingKeep?.keep.id}`
+                          : ""}
+                      </li>
+                    );
+                  })}
+                </ul>
+                <p className="text-xs">This cannot be undone.</p>
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel data-testid="button-cancel-resolve">Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                // Kept open until the request settles so a failure can be read and retried.
+                e.preventDefault();
+                handleConfirmResolve();
+              }}
+              disabled={resolveDuplicates.isPending}
+              data-testid="button-confirm-resolve"
+            >
+              {resolveDuplicates.isPending ? "Resolving…" : "Keep and delete the rest"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         {/* Wall keying */}

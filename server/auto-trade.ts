@@ -15,6 +15,7 @@ import { storage } from "./storage";
 import { buildProposal, branchPolicy, type FlyProposal, type BranchPolicy } from "./proposal-engine";
 import { analyzeChain, MONDAY_TO_THURSDAY_TRADING_DAYS, type ChainFn, type ChainData } from "./chain-analysis";
 import { resolveExitPolicy, type ExitPolicy } from "../shared/exit-policy";
+import { canonicalWall } from "../shared/wall-selection";
 import { callModelOnce } from "./copilot";
 
 export interface GatekeeperVerdict {
@@ -202,15 +203,23 @@ export async function runAutoTrade(
     stopLossPctOfMaxLoss: settings?.stopLossPctOfMaxLoss ?? -0.4,
   });
 
-  // The branch comes from the most recent stored wall. A wall keyed for an earlier week
-  // does not describe this week's market, so the branch is only honoured when its week
-  // matches; otherwise there is no active branch and the engine stands down.
-  const newestWall = walls
-    .slice()
-    .sort((a, b) => (a.weekOf < b.weekOf ? 1 : a.weekOf > b.weekOf ? -1 : b.id - a.id))[0];
+  // The branch comes from the stored wall for THIS symbol and this keying week. A wall keyed
+  // for an earlier week does not describe this week's market, so the branch is only honoured
+  // when the week matches; otherwise there is no active branch and the engine stands down.
+  //
+  // Scoped by symbol as well as week: this selection previously took the newest wall of any
+  // symbol, so a SPY wall keyed after the QQQ one would hand its branch to a QQQ entry. And
+  // within the symbol + week, the winner is the canonical row from shared/wall-selection, so
+  // a duplicated week resolves to the same row the Campaign page edits and the copilot reads.
   const keyingMonday = keyingMondayFor(today);
-  const wallApplies = newestWall?.weekOf === keyingMonday;
-  const branch = wallApplies ? newestWall?.activeBranch ?? null : null;
+  const activeWall = canonicalWall(walls, symbol, keyingMonday) ?? null;
+  const newestWall =
+    activeWall ??
+    walls
+      .filter((w) => w.symbol === symbol)
+      .sort((a, b) => (a.weekOf < b.weekOf ? 1 : a.weekOf > b.weekOf ? -1 : b.id - a.id))[0];
+  const wallApplies = activeWall !== null;
+  const branch = wallApplies ? activeWall.activeBranch ?? null : null;
   const bp = branchPolicy(branch ?? "");
   base.branch = branch;
   base.branchPolicy = bp;
@@ -220,9 +229,9 @@ export async function runAutoTrade(
       ...base,
       outcome: "no_proposal",
       detail: newestWall
-        ? `The most recent wall is keyed for ${newestWall.weekOf}, not the current keying week ` +
+        ? `The most recent ${symbol} wall is keyed for ${newestWall.weekOf}, not the current keying week ` +
           `${keyingMonday}. A stale wall does not define a branch, so there is nothing to enter.`
-        : "No campaign wall has ever been keyed, so there is no branch to trade.",
+        : `No ${symbol} campaign wall has ever been keyed, so there is no branch to trade.`,
     };
   }
 

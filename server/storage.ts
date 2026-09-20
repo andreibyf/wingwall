@@ -15,7 +15,7 @@ import type {
 } from '@shared/schema';
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { eq, desc } from "drizzle-orm";
+import { eq, and, inArray, desc } from "drizzle-orm";
 
 if (!process.env.DATABASE_URL) {
   throw new Error("DATABASE_URL is required (Render Postgres connection string)");
@@ -27,6 +27,13 @@ const pool = new Pool({
 });
 
 export const db = drizzle(pool);
+
+// Outcome of collapsing a duplicated (symbol, weekOf) group. A refusal is returned as data
+// rather than thrown: "the row you chose is no longer in that group" is an ordinary race
+// with another tab, and the UI needs to say which rows survived, not show a 500.
+export type ResolveDuplicateWallsResult =
+  | { ok: true; kept: CampaignWall; deletedIds: number[]; fliesRepointed: number }
+  | { ok: false; reason: "keep_not_in_group"; detail: string };
 
 // Bootstrap tables if they don't exist yet (no migration runner in this environment).
 export async function ensureSchema(): Promise<void> {
@@ -346,6 +353,11 @@ export interface IStorage {
   createCampaignWall(wall: InsertCampaignWall): Promise<CampaignWall>;
   updateCampaignWall(id: number, wall: Partial<InsertCampaignWall>): Promise<CampaignWall | undefined>;
   deleteCampaignWall(id: number): Promise<void>;
+  resolveDuplicateCampaignWalls(
+    symbol: string,
+    weekOf: string,
+    keepId: number,
+  ): Promise<ResolveDuplicateWallsResult>;
 
   getSettings(): Promise<Settings>;
   updateSettings(s: Partial<InsertSettings>): Promise<Settings>;
@@ -441,6 +453,68 @@ export class DatabaseStorage implements IStorage {
 
   async deleteCampaignWall(id: number): Promise<void> {
     await db.delete(campaignWalls).where(eq(campaignWalls.id, id));
+  }
+
+  // Collapse a duplicated (symbol, weekOf) down to one row.
+  //
+  // Two things make this a transaction rather than a loop of deletes from the client:
+  //
+  // 1. flies.campaign_wall_id references the rows being deleted. A logged fill pointing at
+  //    a discarded wall would lose its campaign attribution silently -- the Journal would
+  //    still show the trade, just no longer tied to the week it was traded under. So the
+  //    surviving row adopts those flies in the same transaction.
+  // 2. A partial failure here is worse than the duplication it is fixing: flies repointed
+  //    but rows not deleted, or some rows deleted and others left, produces a state nobody
+  //    designed for. All-or-nothing keeps the pre-existing duplicate state intact on
+  //    failure, which is recoverable by simply trying again.
+  //
+  // The keeper is re-read inside the transaction rather than trusted from the request, so a
+  // row deleted by another tab between the page render and the click cannot cause the
+  // deletion of every sibling with nothing kept.
+  async resolveDuplicateCampaignWalls(
+    symbol: string,
+    weekOf: string,
+    keepId: number,
+  ): Promise<ResolveDuplicateWallsResult> {
+    return db.transaction(async (tx) => {
+      const group = await tx
+        .select()
+        .from(campaignWalls)
+        .where(and(eq(campaignWalls.symbol, symbol), eq(campaignWalls.weekOf, weekOf)));
+
+      const kept = group.find((w) => w.id === keepId);
+      if (!kept) {
+        return {
+          ok: false as const,
+          reason: "keep_not_in_group" as const,
+          detail:
+            `Wall ${keepId} is not a ${symbol} wall for the week of ${weekOf}. Nothing was ` +
+            `deleted. Reload the page and pick again — the rows may have changed since it loaded.`,
+        };
+      }
+
+      const discardIds = group.filter((w) => w.id !== keepId).map((w) => w.id);
+      if (discardIds.length === 0) {
+        // Not an error: two tabs resolving the same group is the likely cause, and the end
+        // state is the one that was asked for.
+        return { ok: true as const, kept, deletedIds: [], fliesRepointed: 0 };
+      }
+
+      const repointed = await tx
+        .update(flies)
+        .set({ campaignWallId: kept.id })
+        .where(inArray(flies.campaignWallId, discardIds))
+        .returning({ id: flies.id });
+
+      await tx.delete(campaignWalls).where(inArray(campaignWalls.id, discardIds));
+
+      return {
+        ok: true as const,
+        kept,
+        deletedIds: discardIds,
+        fliesRepointed: repointed.length,
+      };
+    });
   }
 
   async getSettings(): Promise<Settings> {
