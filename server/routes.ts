@@ -370,6 +370,26 @@ export async function registerRoutes(
   });
 
   // ---- Campaign walls ----
+  app.post("/api/campaign/resolve-duplicates", async (req, res, next) => {
+    const parsed = z.object({
+      keepId: z.number().int().positive(),
+      duplicateIds: z.array(z.number().int().positive()).min(1),
+    }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ message: "Select a wall and its duplicates" });
+    const { keepId, duplicateIds } = parsed.data;
+    if (duplicateIds.includes(keepId) || new Set(duplicateIds).size !== duplicateIds.length) {
+      return res.status(400).json({ message: "Invalid duplicate wall selection" });
+    }
+    try {
+      if (!await storage.resolveCampaignWalls(keepId, duplicateIds)) {
+        return res.status(409).json({ message: "Walls changed. Refresh and review the duplicates again." });
+      }
+      res.json({ keepId, removed: duplicateIds.length });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   app.get("/api/campaign", async (_req, res, next) => {
     try {
       res.json(await storage.listCampaignWalls());

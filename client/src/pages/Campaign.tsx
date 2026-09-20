@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import {
   useCampaignWalls,
@@ -211,6 +211,34 @@ export default function Campaign() {
     () => (walls ?? []).find((w) => w.symbol === symbol && w.weekOf === weekOf),
     [walls, symbol, weekOf]
   );
+  const queryClient = useQueryClient();
+  const matchingWalls = (walls ?? []).filter((w) => w.symbol === symbol && w.weekOf === weekOf);
+  const [keepWallId, setKeepWallId] = useState<number | null>(null);
+  const [reviewDuplicates, setReviewDuplicates] = useState(false);
+  useEffect(() => {
+    setKeepWallId(null);
+    setReviewDuplicates(false);
+  }, [symbol, weekOf, walls]);
+  const resolveDuplicates = useMutation({
+    mutationFn: async (keepId: number) => {
+      const response = await apiRequest("POST", "/api/campaign/resolve-duplicates", {
+        keepId,
+        duplicateIds: matchingWalls.filter((w) => w.id !== keepId).map((w) => w.id),
+      });
+      return response.json();
+    },
+    onSuccess: async () => {
+      setReviewDuplicates(false);
+      await queryClient.invalidateQueries();
+      toast({ title: "Duplicate walls resolved", description: "The selected wall was kept and linked paper trades were preserved." });
+    },
+    onError: (error: Error) => {
+      setReviewDuplicates(false);
+      setKeepWallId(null);
+      toast({ title: "Could not resolve walls", description: error.message, variant: "destructive" });
+      void queryClient.invalidateQueries({ queryKey: ["/api/campaign"] });
+    },
+  });
 
   const [wallPrice, setWallPrice] = useState("");
   const [referenceClose, setReferenceClose] = useState("");
@@ -230,7 +258,7 @@ export default function Campaign() {
       setActiveBranch("pending");
       setNotes("");
     }
-  }, [existing?.id, symbol]);
+  }, [existing, symbol, weekOf]);
 
   const gapPercent = useMemo(() => {
     const wp = parseFloat(wallPrice);
@@ -312,6 +340,42 @@ export default function Campaign() {
         {/* Wall keying */}
         <div className="flex flex-col gap-4 rounded-lg border border-card-border bg-card p-4">
           <h2 className="text-sm font-semibold">Key this week's wall</h2>
+          {matchingWalls.length > 1 && (
+            <section className="rounded-md border border-destructive p-3 space-y-3" aria-label="Resolve duplicate walls">
+              <p role="alert" className="text-sm">
+                {matchingWalls.length} walls exist for {symbol}, week of {weekOf}. Choose the correct record before editing.
+              </p>
+              <fieldset disabled={resolveDuplicates.isPending} className="space-y-2">
+                <legend className="text-sm font-semibold">Wall to keep</legend>
+                {matchingWalls.map((wall) => (
+                  <label key={wall.id} className="flex items-start gap-2 rounded border p-2 text-sm">
+                    <input type="radio" name="keep-wall" checked={keepWallId === wall.id}
+                      onChange={() => { setKeepWallId(wall.id); setReviewDuplicates(false); }} />
+                    <span className="min-w-0 break-words">
+                      #{wall.id} · {fmtUsd(wall.wallPrice)} · {wall.activeBranch}
+                      <span className="block text-xs text-muted-foreground">Created {wall.createdAt}</span>
+                      <span className="block text-xs">Reference close: {wall.referenceClose ?? "Not set"} · Gap: {wall.gapPercent ?? "Not set"} · Re-keyed: {wall.reKeyed ? "Yes" : "No"}</span>
+                      <span className="block">{wall.notes || "No notes"}</span>
+                    </span>
+                  </label>
+                ))}
+              </fieldset>
+              {reviewDuplicates ? (
+                <div className="space-y-2">
+                  <p className="text-sm">Keep #{keepWallId} and permanently remove {matchingWalls.filter((w) => w.id !== keepWallId).map((w) => `#${w.id}`).join(", ")}? Their notes and wall values will not be merged. Linked paper trades will point to the kept wall. No orders will be placed.</p>
+                  <div className="flex flex-wrap gap-2">
+                    <Button variant="destructive" disabled={resolveDuplicates.isPending || keepWallId === null}
+                      onClick={() => { if (keepWallId !== null) resolveDuplicates.mutate(keepWallId); }}>
+                      {resolveDuplicates.isPending ? "Resolving…" : "Confirm resolution"}
+                    </Button>
+                    <Button variant="outline" disabled={resolveDuplicates.isPending} onClick={() => setReviewDuplicates(false)}>Cancel</Button>
+                  </div>
+                </div>
+              ) : (
+                <Button variant="outline" disabled={keepWallId === null} onClick={() => setReviewDuplicates(true)}>Resolve duplicate walls</Button>
+              )}
+            </section>
+          )}
           <div className="grid grid-cols-2 gap-3">
             <div className="flex flex-col gap-1.5">
               <Label className="text-xs">Wall price</Label>
@@ -348,7 +412,7 @@ export default function Campaign() {
             <Textarea data-testid="input-wall-notes" value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} />
           </div>
 
-          <Button onClick={handleSaveWall} disabled={createWall.isPending || updateWall.isPending} data-testid="button-save-wall">
+          <Button onClick={handleSaveWall} disabled={matchingWalls.length > 1 || createWall.isPending || updateWall.isPending} data-testid="button-save-wall">
             {existing ? "Update wall" : "Save wall"}
           </Button>
 
