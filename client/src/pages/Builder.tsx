@@ -1,11 +1,15 @@
 import { useMemo, useState } from "react";
-import { useChain, useFlies, useCreateFly, useFlyPrice } from "@/lib/hooks";
+import { useChain, useFlies, useCreateFly, useFlyPrice, useCampaignWalls } from "@/lib/hooks";
 import { computeFlyPricing, deriveFlyEconomics, getMultiplier, buildPayoffCurve } from "@/lib/flyMath";
-import { fmtUsd, fmtNum, todayIso } from "@/lib/format";
+// Imported, not restated: the branch -> expected side rule must have exactly one definition, or
+// the Builder could warn about a mismatch the review does not flag, or stay silent on one it does.
+import { expectedSideForBranch } from "@shared/learning";
+import { fmtUsd, fmtNum, todayIso, weekOfMonday } from "@/lib/format";
 import { PayoffChart } from "@/components/app/PayoffChart";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -28,11 +32,34 @@ export default function Builder() {
   const [contracts, setContracts] = useState<string>("1");
   const [manualExpiration, setManualExpiration] = useState<string>("");
   const [manualDebit, setManualDebit] = useState<string>("");
+  // Thesis capture. branchOverride is null until the operator deliberately picks a different
+  // branch from the one keyed for the week, so the common case records the keyed branch without
+  // anyone retyping it -- retyping is how the wall and the trade drift apart.
+  const [branchOverride, setBranchOverride] = useState<string | null>(null);
+  const [thesis, setThesis] = useState<string>("");
 
   const isLive = SYMBOLS.find((s) => s.value === symbol)?.live ?? false;
   const { data: chain, isLoading: chainLoading, error: chainError } = useChain(symbol, isLive);
   const { data: flies } = useFlies();
   const createFly = useCreateFly();
+  const { data: walls } = useCampaignWalls();
+
+  // The wall for THIS week and THIS symbol. Same selector Campaign.tsx uses, so the Builder can
+  // never show a branch the Campaign page disagrees with.
+  const weekOf = weekOfMonday();
+  const activeWall = useMemo(
+    () => (walls ?? []).find((w) => w.symbol === symbol && w.weekOf === weekOf),
+    [walls, symbol, weekOf]
+  );
+  const keyedBranch = activeWall?.activeBranch ?? null;
+  const effectiveBranch = branchOverride ?? keyedBranch;
+  // "pending" is not a thesis -- it is the absence of one, and it must be stored as null so the
+  // review reports an unrecorded branch instead of scoring the trade against the string.
+  const branchToStore =
+    effectiveBranch && effectiveBranch !== "pending" ? effectiveBranch : null;
+  const expectedSide = expectedSideForBranch(effectiveBranch);
+  const sideMismatch = expectedSide !== null && expectedSide !== optionType;
+  const liveSpot = isLive ? chain?.spot ?? null : null;
 
   const expirations = chain?.expirations ?? [];
   const activeExpiration = expiration || expirations[0] || "";
@@ -164,9 +191,18 @@ export default function Builder() {
           exitDate: null,
           maxLoss: Math.round(pricing.maxLossMid ?? 0),
           maxProfit: Math.round(pricing.maxProfit ?? 0),
-          campaignWallId: null,
+          campaignWallId: activeWall?.id ?? null,
           notes: null,
+          // Thesis snapshot. entryBranch and entryWall are copied in rather than read back
+          // through campaignWallId at review time, because a wall can be re-keyed mid-week and
+          // the trade must stay bound to the branch it was actually taken under.
+          entryBranch: branchToStore,
+          entryThesis: thesis.trim() || null,
+          entryWall: activeWall?.wallPrice ?? null,
+          entrySpot: liveSpot,
         });
+        setThesis("");
+        setBranchOverride(null);
         toast({ title: "Fly logged", description: `${symbol} ${activeExpiration} ${legs.lowerStrike}/${legs.middleStrike}/${legs.upperStrike} added to journal.` });
       } else if (manualPricing) {
         await createFly.mutateAsync({
@@ -185,9 +221,18 @@ export default function Builder() {
           exitDate: null,
           maxLoss: Math.round(manualPricing.maxLoss),
           maxProfit: Math.round(manualPricing.maxProfit),
-          campaignWallId: null,
+          campaignWallId: activeWall?.id ?? null,
           notes: null,
+          entryBranch: branchToStore,
+          entryThesis: thesis.trim() || null,
+          entryWall: activeWall?.wallPrice ?? null,
+          // Manual entry has no live chain, so there is no spot to record. Null, not the last
+          // known quote -- a stale spot would make the grinds body-offset review arithmetic
+          // wrong while looking perfectly precise.
+          entrySpot: null,
         });
+        setThesis("");
+        setBranchOverride(null);
         toast({ title: "Fly logged", description: `${symbol} ${manualExpiration.trim()} ${legs.lowerStrike}/${legs.middleStrike}/${legs.upperStrike} added to journal.` });
       }
     } catch (e: any) {
@@ -337,6 +382,97 @@ export default function Builder() {
               />
             </div>
           )}
+
+          {/* ---- Thesis capture ------------------------------------------------------------
+              Sits immediately above the log button, because this is the last moment the
+              reasoning still exists. Every fly closed before this shipped had a null branch and
+              null notes, which is why none of them could be reviewed against an intention. */}
+          <div className="flex flex-col gap-2 rounded-md border border-card-border bg-background/40 p-3">
+            <div className="flex items-center justify-between">
+              <Label className="text-xs font-semibold">Thesis</Label>
+              <Badge variant="outline" className="font-mono text-[10px]">Week of {weekOf}</Badge>
+            </div>
+
+            {!activeWall ? (
+              <div
+                className="rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-xs text-destructive"
+                data-testid="warning-thesis-unkeyed"
+              >
+                No wall keyed for {symbol} this week. This trade will be recorded with no branch
+                and no wall, so its outcome cannot be reviewed against an intention later. Key the
+                wall on the Campaign page first.
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 gap-x-3 gap-y-1 font-mono text-xs">
+                <span className="text-muted-foreground">Wall</span>
+                <span className="text-right tabular-nums" data-testid="text-thesis-wall">
+                  {fmtUsd(activeWall.wallPrice)}
+                </span>
+                <span className="text-muted-foreground">Spot</span>
+                <span className="text-right tabular-nums" data-testid="text-thesis-spot">
+                  {liveSpot !== null ? fmtUsd(liveSpot) : "not recorded"}
+                </span>
+              </div>
+            )}
+
+            <div className="flex flex-col gap-1.5">
+              <Label className="text-xs">Branch</Label>
+              <Select
+                value={effectiveBranch ?? "pending"}
+                onValueChange={(v) => setBranchOverride(v)}
+              >
+                <SelectTrigger data-testid="select-thesis-branch">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="pending">Not recorded</SelectItem>
+                  <SelectItem value="rejects">rejects — fades below (put)</SelectItem>
+                  <SelectItem value="grinds">grinds — holds, re-center (put)</SelectItem>
+                  <SelectItem value="breaks">breaks — through the wall (call)</SelectItem>
+                </SelectContent>
+              </Select>
+              {keyedBranch && keyedBranch !== "pending" && branchOverride !== null && branchOverride !== keyedBranch && (
+                <span className="text-[11px] text-chart-3" data-testid="text-thesis-branch-override">
+                  Overriding the keyed branch ({keyedBranch}) for this trade only. The wall stays
+                  as it is.
+                </span>
+              )}
+              {(!effectiveBranch || effectiveBranch === "pending") && activeWall && (
+                <span className="text-[11px] text-destructive" data-testid="text-thesis-branch-unset">
+                  Branch not set for the week. Logging now records no branch, and the review will
+                  report this trade as having no thesis.
+                </span>
+              )}
+            </div>
+
+            {sideMismatch && (
+              <div
+                className="rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-xs text-destructive"
+                data-testid="warning-thesis-side-mismatch"
+              >
+                {effectiveBranch} calls for a {expectedSide} fly, but this is a {optionType} fly.
+                Not blocked — a deliberate counter-read is a legitimate trade — but it will be
+                recorded and reviewed as a structure that contradicted its own thesis.
+              </div>
+            )}
+
+            <div className="flex flex-col gap-1.5">
+              <Label className="text-xs">Why this trade, in one line</Label>
+              <Textarea
+                data-testid="input-thesis"
+                value={thesis}
+                onChange={(e) => setThesis(e.target.value)}
+                rows={2}
+                placeholder="e.g. Wall 725 held all morning; re-centering the body ~2% below the open."
+                className="text-xs"
+              />
+              {thesis.trim().length === 0 && (
+                <span className="text-[11px] text-muted-foreground" data-testid="text-thesis-empty">
+                  Optional, but this is the only place the reasoning gets recorded.
+                </span>
+              )}
+            </div>
+          </div>
 
           {collision && (
             <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive" data-testid="warning-blocked-strikes">
