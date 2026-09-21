@@ -1,5 +1,13 @@
 # Copilot empty-response recovery
 
+## Investigation update
+
+The subsequent direct-provider investigation reproduced token exhaustion with
+1,400 thinking tokens and zero answer characters. See
+[COPILOT-ROOT-CAUSE.md](COPILOT-ROOT-CAUSE.md) for the controlled comparison,
+provider message IDs, historical-evidence limits, and corrective recommendation.
+This PR is still unmerged and must be revised beyond mitigation before rollout.
+
 ## Confirmed defect
 
 The old chat handler converted upstream responses without text blocks into a
