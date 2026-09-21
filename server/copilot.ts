@@ -418,9 +418,9 @@ export async function buildSignalSnapshot(priceFly: PricingFn, fetchChain?: Chai
       stopLossDescription: exitPolicy.describeStopLoss,
       configuredIn: "Settings, stored in the database — not hardcoded",
       note:
-        "A scheduled job checks open flies hourly during market hours and auto-closes on " +
-        "either threshold. Read takeProfitDescription rather than assuming a percent-of-max-" +
-        "profit rule; the default is a multiple of the entry debit.",
+        "Paper-worker readiness and outcomes are reported in Settings. Never claim a position is protected " +
+        "without a healthy heartbeat and paper-write mode. Observation mode records decisions only. " +
+        "Stale or delayed quotes block automatic writes. The default target is a multiple of entry debit.",
     },
     openPositions: open,
     capitalDeployed: round(openFlies.reduce((s, f) => s + f.maxLoss, 0)),
@@ -527,13 +527,14 @@ Keep replies tight — a few short paragraphs or a compact list. This renders in
 export async function callModelOnce(
   system: string,
   userContent: string,
-  maxTokens = 1200,
+  maxTokens = 8192,
 ): Promise<{ text: string; model: string }> {
   const apiKey = readApiKey();
   if (!apiKey) throw Object.assign(new Error("Copilot is not configured"), { status: 503 });
 
   const res = await fetch(`${ANTHROPIC_BASE}/messages`, {
     method: "POST",
+    signal: AbortSignal.timeout(45_000),
     headers: {
       "content-type": "application/json",
       "x-api-key": apiKey,
@@ -541,7 +542,7 @@ export async function callModelOnce(
     },
     body: JSON.stringify({
       model: DEFAULT_MODEL,
-      max_tokens: maxTokens,
+      ...getCopilotChatPolicy(DEFAULT_MODEL, String(Math.max(8192,maxTokens))),
       system,
       messages: [{ role: "user", content: userContent }],
     }),
@@ -559,6 +560,7 @@ export async function callModelOnce(
   }
 
   const data = await res.json();
+  if (data?.stop_reason !== "end_turn") throw Object.assign(new Error("Risk gate response incomplete; no entry authorized"), {status:502});
   const text = Array.isArray(data?.content)
     ? data.content
         .filter((b: any) => b?.type === "text")
@@ -566,6 +568,7 @@ export async function callModelOnce(
         .join("")
         .trim()
     : "";
+  if (!text) throw Object.assign(new Error("Risk gate returned no answer; no entry authorized"),{status:502});
   return { text, model: data?.model ?? DEFAULT_MODEL };
 }
 

@@ -1,7 +1,10 @@
 import "dotenv/config";
 import express, { Response, NextFunction } from 'express';
 import type { Request } from 'express';
-import { registerRoutes } from "./routes";
+import { registerRoutes, getChain, getFlyLivePricing } from "./routes";
+import { buildSignalSnapshot } from "./copilot";
+import { installOperatorAuth } from "./operator-auth";
+import { startPaperWorkers, workerStatus } from "./paper-worker";
 import { serveStatic } from "./static";
 import { createServer } from "node:http";
 import { ensureSchema } from "./storage";
@@ -24,6 +27,8 @@ app.use(
 );
 
 app.use(express.urlencoded({ extended: false }));
+// Auth routes are before response logging. Cookies and credentials are never logged.
+installOperatorAuth(app);
 
 export function log(message: string, source = "express") {
   const formattedTime = new Date().toLocaleTimeString("en-US", {
@@ -51,9 +56,7 @@ app.use((req, res, next) => {
     const duration = Date.now() - start;
     if (path.startsWith("/api")) {
       let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
-      if (capturedJsonResponse) {
-        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
-      }
+      // Do not log full positions, chat transcripts, or account settings.
 
       log(logLine);
     }
@@ -69,6 +72,12 @@ app.use((req, res, next) => {
   await ensureSchema();
 
   await registerRoutes(httpServer, app);
+  app.get("/health/automation",async(_req,res)=>{
+    try {
+      const status=await workerStatus();
+      res.status(status.healthy?200:503).json({healthy:status.healthy,heartbeatFresh:status.heartbeatFresh,mode:status.mode});
+    } catch {res.status(503).json({healthy:false});}
+  });
 
   app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
     if (res.headersSent) {
@@ -123,6 +132,11 @@ app.use((req, res, next) => {
     },
     () => {
       log(`serving on port ${port}`);
+      const stop=startPaperWorkers({
+        fetchChain:getChain,quote:getFlyLivePricing,
+        buildSnapshot:()=>buildSignalSnapshot(getFlyLivePricing,getChain),
+      });
+      process.once("SIGTERM",()=>{stop();httpServer.close();});
     },
   );
 })();

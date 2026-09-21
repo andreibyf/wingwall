@@ -1,0 +1,183 @@
+import assert from "node:assert/strict";
+import {before,beforeEach,after,test} from "node:test";
+import {Pool} from "pg";
+import express from "express";
+import {createServer,type Server} from "node:http";
+import {once} from "node:events";
+
+const url=new URL(process.env.TEST_DATABASE_URL??"postgresql://localhost:55432/postgres");
+assert.equal(url.hostname,"localhost");assert.equal(url.pathname,"/postgres");assert.equal(url.search,"");
+const name=`wingwall_automation_${process.pid}_${Date.now()}`;
+const admin=new Pool({connectionString:url.toString(),ssl:false});
+let sql:Pool, appPool:Pool, server:Server, base:string;
+let storage:any, commitEntry:any, commitExit:any, runWorker:any, runAuto:any, parseVerdict:any, workerStatus:any;
+const now=new Date("2026-09-21T14:00:00Z");
+const position={symbol:"QQQ",optionType:"put",structureType:"symmetric",expiration:"2026-09-24",
+  lowerStrike:95,middleStrike:100,upperStrike:105,contracts:1,entryDebit:1,entryDate:"2026-09-21",
+  status:"open",exitDebit:null,exitDate:null,maxLoss:100,maxProfit:400,campaignWallId:1,notes:"fixture",peakProfitPct:null,peakLossPct:null};
+
+before(async()=>{
+  await admin.query(`CREATE DATABASE "${name}"`);url.pathname=`/${name}`;
+  process.env.DATABASE_URL=url.toString();
+  process.env.WINGWALL_OPERATOR_PASSWORD="integration-only-passphrase";
+  process.env.PAPER_AUTOMATION_MODE="paper";
+  sql=new Pool({connectionString:url.toString(),ssl:false});
+  const module=await import("../server/storage");storage=module.storage;appPool=module.db.$client;
+  await module.ensureSchema();await module.ensureSchema();
+  await storage.getSettings();
+  ({commitPaperEntry:commitEntry,commitPaperExit:commitExit}=await import("../server/paper-ledger"));
+  ({runPaperWorker:runWorker,workerStatus}=await import("../server/paper-worker"));
+  ({runAutoTrade:runAuto,parseVerdict}=await import("../server/auto-trade"));
+  const {installOperatorAuth}=await import("../server/operator-auth");
+  const {registerRoutes}=await import("../server/routes");
+  const app=express();app.use(express.json());installOperatorAuth(app);
+  server=createServer(app);await registerRoutes(server,app);
+  app.use((err:any,_req:any,res:any,_next:any)=>res.status(err.status??500).json({message:err.message}));
+  server.listen(0,"127.0.0.1");await once(server,"listening");
+  base=`http://127.0.0.1:${(server.address() as any).port}`;
+});
+beforeEach(async()=>{
+  process.env.PAPER_AUTOMATION_MODE="paper";delete process.env.PAPER_EXIT_ENABLED;
+  process.env.WINGWALL_OPERATOR_PASSWORD="integration-only-passphrase";
+  await sql.query(`DROP TRIGGER IF EXISTS reject_journal ON journal_notes;
+    TRUNCATE flies,campaign_walls,journal_notes,paper_entry_claims,paper_worker_runs,operator_login_attempts RESTART IDENTITY;
+    UPDATE settings SET auto_trade_enabled=true,default_symbol='QQQ',account_balance=1000,risk_per_trade_percent=10,
+      take_profit_mode='multipleOfDebit',take_profit_value=2,stop_loss_pct_of_max_loss=-0.4;
+    INSERT INTO campaign_walls (symbol,week_of,wall_price,active_branch,created_at)
+      VALUES('QQQ','2026-09-21',100,'rejects','2026-09-21');`);
+});
+after(async()=>{
+  if(server?.listening)await new Promise<void>(resolve=>server.close(()=>resolve()));
+  await appPool?.end();await sql?.end();
+  await admin.query(`DROP DATABASE IF EXISTS "${name}"`);await admin.end();
+});
+async function input() {return {fly:{...position},journal:"test-only",settingsSnapshot:await storage.getSettings(),
+  wallSnapshot:(await storage.listCampaignWalls())[0],quoteTimestamp:now.toISOString(),now:()=>now};}
+async function login(){
+  const r=await fetch(`${base}/api/auth/login`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({password:"integration-only-passphrase"})});
+  assert.equal(r.status,200);return r.headers.get("set-cookie")!.split(";")[0];
+}
+async function failJournal(){
+  await sql.query(`CREATE OR REPLACE FUNCTION reject_paper_journal() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN RAISE EXCEPTION 'injected journal failure'; END $$;
+    CREATE TRIGGER reject_journal BEFORE INSERT ON journal_notes FOR EACH ROW EXECUTE FUNCTION reject_paper_journal();`);
+}
+test("entry and journal commit exactly once under concurrent requests",async()=>{
+  const i=await input();const results=await Promise.allSettled([commitEntry(i),commitEntry(i)]);
+  assert.equal(results.filter(r=>r.status==="fulfilled").length,1);
+  assert.equal((await storage.listFlies()).length,1);assert.equal((await storage.listJournalNotes()).length,1);
+  assert.equal((await sql.query("SELECT * FROM paper_entry_claims")).rowCount,1);
+});
+test("entry journal failure rolls back position and claim; retry succeeds",async()=>{
+  const i=await input();await failJournal();await assert.rejects(commitEntry(i),(err:any)=>/injected/.test(err.cause?.message));
+  assert.equal((await storage.listFlies()).length,0);assert.equal((await sql.query("SELECT * FROM paper_entry_claims")).rowCount,0);
+  await sql.query("DROP TRIGGER reject_journal ON journal_notes");await commitEntry(i);
+});
+test("closed or deleted same-week automated entry cannot be re-entered",async()=>{
+  const i=await input();await commitEntry(i);
+  await sql.query("UPDATE flies SET status='closed'");await assert.rejects(commitEntry(i),/entry already exists/);
+  await sql.query("DELETE FROM flies");await assert.rejects(commitEntry(i),/claimed/);
+});
+test("entry disarm and changed settings during model review fail closed",async()=>{
+  const i=await input();await storage.updateSettings({autoTradeEnabled:false});
+  await assert.rejects(commitEntry(i),/Settings changed/);
+  await storage.updateSettings({autoTradeEnabled:true,riskPerTradePercent:1});
+  await assert.rejects(commitEntry(i),/Settings changed/);
+});
+test("changed wall, stale timestamp, out-of-window and observation mode reject commit",async()=>{
+  const i=await input();
+  await sql.query("UPDATE campaign_walls SET symbol='SPY'");await assert.rejects(commitEntry(i),/Campaign changed/);
+  await sql.query("UPDATE campaign_walls SET symbol='QQQ'");
+  await assert.rejects(commitEntry({...i,quoteTimestamp:"2026-09-21T13:55:00Z"}),/fresh/);
+  await assert.rejects(commitEntry({...i,now:()=>new Date("2026-09-21T22:00:00Z")}),/in-window/);
+  process.env.PAPER_AUTOMATION_MODE="observe";await assert.rejects(commitEntry(i),/authorized/);
+});
+test("exit and journal commit exactly once despite retries; entry disarmed does not block exit",async()=>{
+  const {flyId}=await commitEntry(await input());await storage.updateSettings({autoTradeEnabled:false});
+  const i={flyId,mid:2,timestamp:now.toISOString(),source:"test-fixture",now:()=>now};
+  const results=await Promise.all([commitExit(i),commitExit(i)]);
+  assert.deepEqual(results.map(r=>r.outcome).sort(),["already_closed","closed"]);
+  assert.equal((await storage.getFly(flyId)).status,"closed");
+  assert.equal((await storage.listJournalNotes()).length,2);
+});
+test("failed exit journal rolls back closure; changed policy is re-evaluated",async()=>{
+  const {flyId}=await commitEntry(await input());
+  const i={flyId,mid:2,timestamp:now.toISOString(),source:"fixture",now:()=>now};
+  await failJournal();await assert.rejects(commitExit(i),(err:any)=>/injected/.test(err.cause?.message));assert.equal((await storage.getFly(flyId)).status,"open");
+  await sql.query("DROP TRIGGER reject_journal ON journal_notes");
+  await storage.updateSettings({takeProfitValue:3});await assert.rejects(commitExit(i),/trigger/);
+  assert.equal((await storage.getFly(flyId)).status,"open");
+});
+test("exit switch and stale quotes block paper writes",async()=>{
+  const {flyId}=await commitEntry(await input());
+  const i={flyId,mid:2,timestamp:now.toISOString(),source:"fixture",now:()=>now};
+  process.env.PAPER_EXIT_ENABLED="false";await assert.rejects(commitExit(i),/authorized/);
+  delete process.env.PAPER_EXIT_ENABLED;
+  await assert.rejects(commitExit({...i,timestamp:""}),/stale/);
+});
+test("worker observes a qualifying exit without writing and records heartbeat",async()=>{
+  await commitEntry(await input());process.env.PAPER_AUTOMATION_MODE="observe";await storage.updateSettings({autoTradeEnabled:false});
+  const deps={now,fetchChain:async()=>{throw Error("entry should not fetch");},buildSnapshot:async()=>({}),
+    quote:async()=>({midDebit:2,timestamp:now.toISOString(),source:"test-fixture"})};
+  const r=await runWorker(deps);assert.equal(r.outcome,"ok");assert.equal(r.exits[0].outcome,"would_close");
+  assert.equal((await storage.listFlies())[0].status,"open");
+  assert.equal((await workerStatus()).healthy,true);
+  assert.equal((await runWorker(deps)).outcome,"already_ran");
+});
+test("concurrent workers use a database lease and perform one exit",async()=>{
+  await commitEntry(await input());await storage.updateSettings({autoTradeEnabled:false});
+  const deps={now,fetchChain:async()=>{throw Error("disabled");},buildSnapshot:async()=>({}),
+    quote:async()=>({midDebit:2,timestamp:now.toISOString(),source:"test-fixture"})};
+  const results=await Promise.all([runWorker(deps),runWorker(deps)]);
+  assert.equal(results.filter(r=>r.outcome==="ok").length,1);
+  assert.equal((await storage.listFlies())[0].status,"closed");
+  assert.equal((await storage.listJournalNotes()).length,2);
+});
+test("worker records stale quote alert and expired settlement requires review",async()=>{
+  await commitEntry(await input());await storage.updateSettings({autoTradeEnabled:false});
+  const deps={now,fetchChain:async()=>{throw Error("disabled");},buildSnapshot:async()=>({}),
+    quote:async()=>({midDebit:2,timestamp:"",source:"test-fixture"})};
+  const r=await runWorker(deps);assert.equal(r.outcome,"degraded");assert.match(r.alerts[0],/stale/);
+  assert.equal((await workerStatus()).healthy,false);
+  await sql.query("DELETE FROM paper_worker_runs");await sql.query("UPDATE flies SET expiration='2026-09-18'");
+  assert.match((await runWorker(deps)).alerts[0],/expired/);
+});
+test("worker after hours never prices or changes positions",async()=>{
+  await commitEntry(await input());
+  const unexpected=async()=>{throw Error("should not call");};
+  const r=await runWorker({now:new Date("2026-09-21T22:00:00Z"),fetchChain:unexpected,buildSnapshot:unexpected,quote:unexpected});
+  assert.equal(r.outcome,"ok");assert.equal((await storage.listFlies())[0].status,"open");
+});
+test("disabled entry and Thursday guard run before external requests",async()=>{
+  const deps={now,fetchChain:async()=>{throw Error("unexpected");},buildSnapshot:async()=>({})};
+  await storage.updateSettings({autoTradeEnabled:false});assert.equal((await runAuto(deps)).outcome,"disabled");
+  await storage.updateSettings({autoTradeEnabled:true});
+  assert.match((await runAuto({...deps,now:new Date("2026-09-24T14:00:00Z")})).detail,/Thursday/);
+});
+test("gate rejects empty, incomplete schemas and prose-wrapped JSON",()=>{
+  for(const text of ["",'{"approved":true,"rationale":"ok"}','prefix {"approved":true,"confidence":"high","rationale":"ok","concerns":[]}']) {
+    assert.equal(parseVerdict(text,"fixture").approved,false);
+  }
+  assert.equal(parseVerdict('{"approved":true,"confidence":"high","rationale":"ok","concerns":[]}',"fixture").approved,true);
+});
+test("unauthenticated reads, writes and entry preview are denied",async()=>{
+  for(const [method,path] of [["GET","/api/settings"],["PUT","/api/settings"],["GET","/api/auto-trade/preview"],["POST","/api/auto-trade/run"],["PATCH","/api/flies/1"]]) {
+    assert.equal((await fetch(base+path,{method})).status,401);
+  }
+});
+test("operator session, same-origin protection and fail-closed unset password",async()=>{
+  const cookie=await login();
+  assert.equal((await fetch(base+"/api/settings",{headers:{cookie}})).status,200);
+  assert.equal((await fetch(base+"/api/settings",{method:"PUT",headers:{cookie,origin:"https://attacker.invalid","content-type":"application/json"},body:"{}"})).status,403);
+  delete process.env.WINGWALL_OPERATOR_PASSWORD;
+  assert.equal((await fetch(base+"/api/settings",{headers:{cookie}})).status,401);
+  assert.equal((await fetch(base+"/api/auth/login",{method:"POST",headers:{"content-type":"application/json"},body:'{"password":"anything"}'})).status,503);
+});
+test("login attempts are rate limited across requests",async()=>{
+  for(let i=0;i<10;i++) assert.equal((await fetch(base+"/api/auth/login",{method:"POST",headers:{"content-type":"application/json"},body:'{"password":"wrong"}'})).status,401);
+  assert.equal((await fetch(base+"/api/auth/login",{method:"POST",headers:{"content-type":"application/json"},body:'{"password":"wrong"}'})).status,429);
+});
+test("arming is rejected in observation mode even with authenticated operator",async()=>{
+  process.env.PAPER_AUTOMATION_MODE="observe";const cookie=await login();
+  assert.equal((await fetch(base+"/api/settings",{method:"PUT",headers:{cookie,"content-type":"application/json"},body:'{"autoTradeEnabled":true}'})).status,409);
+});

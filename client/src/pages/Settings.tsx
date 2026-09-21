@@ -10,6 +10,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { useToast } from "@/hooks/use-toast";
 import { AlertTriangle, Loader2, ShieldCheck, Play } from "lucide-react";
 import { resolveExitPolicy } from "@shared/exit-policy";
+import { useQuery } from "@tanstack/react-query";
 
 /**
  * Everything the automation reads at runtime, editable. Nothing on this page is cosmetic:
@@ -50,6 +51,7 @@ export default function Settings() {
   const { data: settings } = useSettings();
   const { data: flies } = useFlies();
   const updateSettings = useUpdateSettings();
+  const {data:automation}=useQuery<any>({queryKey:["/api/automation/status"],refetchInterval:30_000,staleTime:0});
 
   const [draft, setDraft] = useState<Draft | null>(null);
   const [preview, setPreview] = useState<any>(null);
@@ -130,7 +132,7 @@ export default function Settings() {
         title: next ? "Autonomous entry armed" : "Autonomous entry off",
         description: next
           ? "The scheduled run may now open one position per week without asking."
-          : "Scheduled runs will propose and journal, but will not open anything.",
+          : "New entries are disabled. Exit monitoring is independent.",
       });
     } catch (err) {
       toast({ title: "Rejected", description: readableError(err), variant: "destructive" });
@@ -164,16 +166,30 @@ export default function Settings() {
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-6">
       <p className="text-sm text-muted-foreground">
-        These values are read at runtime by the scheduled exit watch and by the proposal engine.
-        Changing one here changes what the automation actually does — nothing on this page is
-        cosmetic, and nothing is hardcoded in the app any more.
+        These settings govern simulated paper positions only. Execution requires a healthy
+        worker, paper-write mode, fresh quotes, and a valid exchange session.
       </p>
+      <section className="rounded-lg border border-border p-4 space-y-2" data-testid="automation-readiness">
+        <h2 className="text-sm font-semibold">Paper-worker readiness</h2>
+        <p className="text-sm">Mode: {automation?.mode ?? "checking"} · Heartbeat: {automation?.heartbeatFresh?"current":"missing or stale"}</p>
+        <p className="text-sm">Entries: {automation?.entryArmed?"armed":"off"} · Exit worker: {automation?.exitsEnabled?"enabled":"disabled"}</p>
+        <p className="text-xs text-muted-foreground">Observation mode evaluates proposals even with entry off, but never opens or closes positions. Paper-write mode requires quotes no more than two minutes old. Entry window: Monday–Wednesday, 9:45–10:30 AM Eastern, excluding holidays.</p>
+        {automation && !automation.healthy && <p role="alert" className="text-sm text-destructive">Worker is not healthy. Do not rely on unattended protection.</p>}
+        {automation?.runs?.slice(0,3).map((r:any)=><div key={r.run_key} className="text-xs break-words">
+          {new Date(r.started_at).toLocaleString()}: {r.outcome}
+          {r.detail?.entry && <p>Entry: {r.detail.entry.outcome}. {r.detail.entry.detail}</p>}
+          {r.detail?.alerts?.length>0 && <p role="alert">{r.detail.alerts.join(" · ")}</p>}
+          {r.detail?.alert && <p role="alert">{r.detail.alert}</p>}
+        </div>)}
+        <Button variant="outline" size="sm" onClick={async()=>{await apiRequest("POST","/api/auth/logout");window.location.reload();}}>Sign out</Button>
+      </section>
 
       {/* ---- Exits ---- */}
       <section className="rounded-lg border border-border p-4">
         <h2 className="text-sm font-semibold">Exit policy</h2>
         <p className="mt-1 text-xs text-muted-foreground">
-          The scheduled watch closes an open fly when either of these is met.
+          In paper-write mode, the worker closes a simulated position when a threshold fires.
+          In observation mode it records the decision without closing.
         </p>
 
         <div className="mt-4 grid gap-4 sm:grid-cols-2">
