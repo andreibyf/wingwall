@@ -15,7 +15,7 @@ import type {
 } from '@shared/schema';
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { eq, desc } from "drizzle-orm";
+import { eq, desc, sql } from "drizzle-orm";
 
 if (!process.env.DATABASE_URL) {
   throw new Error("DATABASE_URL is required (Render Postgres connection string)");
@@ -136,6 +136,18 @@ ALTER TABLE settings ADD COLUMN IF NOT EXISTS stop_loss_pct_of_max_loss REAL NOT
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS target_debit_to_width REAL NOT NULL DEFAULT 0.06;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS max_debit_to_width REAL NOT NULL DEFAULT 0.15;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS auto_trade_enabled BOOLEAN NOT NULL DEFAULT false;
+CREATE TABLE IF NOT EXISTS paper_entry_claims (
+  symbol TEXT NOT NULL, week_of TEXT NOT NULL, fly_id INTEGER NOT NULL,
+  PRIMARY KEY (symbol, week_of)
+);
+CREATE TABLE IF NOT EXISTS paper_worker_runs (
+  run_key TEXT PRIMARY KEY, started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  finished_at TIMESTAMPTZ, mode TEXT NOT NULL, outcome TEXT NOT NULL,
+  detail JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE TABLE IF NOT EXISTS operator_login_attempts (
+  bucket TEXT PRIMARY KEY, attempts INTEGER NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 `);
 
   // Gexbot dealer-positioning cache and quota ledger.
@@ -396,8 +408,19 @@ export class DatabaseStorage implements IStorage {
   }
 
   async updateFly(id: number, fly: Partial<InsertFly>): Promise<Fly | undefined> {
-    const rows = await db.update(flies).set(fly).where(eq(flies.id, id)).returning();
-    return rows[0];
+    return db.transaction(async tx=>{
+      await tx.execute(sql`LOCK TABLE flies IN SHARE ROW EXCLUSIVE MODE`);
+      const [current]=await tx.select().from(flies).where(eq(flies.id,id));
+      if(!current) return undefined;
+      if(current.status==="closed" && fly.status==="open") throw Object.assign(new Error("Closed positions cannot be reopened"),{status:409});
+      if(fly.status==="closed" && current.status==="closed") return current;
+      if(fly.status==="closed" && (!Number.isFinite(fly.exitDebit) || Number(fly.exitDebit)<0 || !fly.exitDate)) throw Object.assign(new Error("Closing requires a nonnegative exit debit and exit date"),{status:400});
+      const [updated]=await tx.update(flies).set(fly).where(eq(flies.id,id)).returning();
+      if(fly.status==="closed") await tx.insert(journalNotes).values({
+        date:fly.exitDate!,category:"general",text:`Operator paper close Fly ${id}, simulated debit $${fly.exitDebit}. No broker order or fill.`,createdAt:new Date().toISOString(),
+      });
+      return updated;
+    });
   }
 
   async deleteFly(id: number): Promise<void> {

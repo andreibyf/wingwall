@@ -28,6 +28,8 @@ import {
 import { computeFlyPricing, getMultiplier, type ChainLeg } from "@shared/flyMath";
 import { z } from "zod";
 import { runAutoTrade, tradingWeek } from "./auto-trade";
+import { freshQuote, paperMode } from "./automation-policy";
+import { workerStatus } from "./paper-worker";
 import { resolveExitPolicy, assessThresholdReachability } from "@shared/exit-policy";
 import { getIbkrFlyQuote, isIbkrSupported, IbkrPricingError } from "./ibkr";
 import {
@@ -51,6 +53,7 @@ const CACHE_MS = 15_000;
 async function fetchCboe(symbol: string): Promise<any> {
   const url = `${CBOE_BASE}/${symbol}.json`;
   const res = await fetch(url, {
+    signal: AbortSignal.timeout(20_000),
     headers: {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -75,7 +78,7 @@ function parseOccSymbol(occ: string, root: string) {
   return { expiration, type: cp === "C" ? "call" : "put", strike };
 }
 
-async function getChain(symbol: string) {
+export async function getChain(symbol: string) {
   const cached = chainCache.get(symbol);
   if (cached && Date.now() - cached.ts < CACHE_MS) return cached.data;
 
@@ -127,7 +130,7 @@ async function getChain(symbol: string) {
     symbol,
     spot,
     prevClose: underlying.prev_day_close ?? underlying.close ?? null,
-    timestamp: raw.timestamp ?? new Date().toISOString(),
+    timestamp: raw.timestamp ?? "",
     expirations,
     options: parsed,
   };
@@ -143,7 +146,7 @@ async function getChain(symbol: string) {
 // is skipped entirely so every request goes straight to Cboe without wasted retries.
 const IBKR_AVAILABLE = process.env.RENDER !== "true" && process.env.DISABLE_IBKR !== "true";
 
-async function getFlyLivePricing(
+export async function getFlyLivePricing(
   symbol: string,
   optionType: "call" | "put",
   expiration: string,
@@ -159,7 +162,9 @@ async function getFlyLivePricing(
     try {
       const quote = await getIbkrFlyQuote(symbol, expiration, optionType, lowerStrike, middleStrike, upperStrike);
       const pricing = computeFlyPricing(legs, [quote.lowerLeg, quote.middleLeg, quote.upperLeg], multiplier);
-      return { source: "ibkr", multiplier, spot: quote.spot, timestamp: new Date().toISOString(), ...pricing };
+      // Connector does not expose a verified provider timestamp. Display is allowed,
+      // but an automated write must not treat retrieval time as quote time.
+      return { source: "ibkr", multiplier, spot: quote.spot, timestamp: "", ...pricing };
     } catch (err) {
       if (!(err instanceof IbkrPricingError)) console.error("IBKR pricing error:", err);
       // fall through to Cboe fallback below
@@ -202,6 +207,9 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
+  app.get("/api/automation/status",async(_req,res,next)=>{
+    try {res.json(await workerStatus());} catch(err){next(err);}
+  });
   // ---- Live fly pricing (IBKR-first, Cboe fallback) ----
   // Fetches real-time bid/ask for exactly the 3 legs of a fly — not a full chain.
   // QQQ/SPY try the connected IBKR account first (real-time SMART-routed equity
@@ -238,7 +246,7 @@ export async function registerRoutes(
   app.post("/api/track-all-open-peaks", async (req, res, next) => {
     try {
       const secret = process.env.CRON_SECRET;
-      if (secret && req.header("x-cron-secret") !== secret) {
+      if (!secret || secret.length<16 || req.header("x-cron-secret") !== secret) {
         return res.status(401).json({ message: "unauthorized" });
       }
       const openFlies = (await storage.listFlies()).filter((f) => f.status === "open");
@@ -258,6 +266,10 @@ export async function registerRoutes(
             results.push({ id: fly.id, skipped: true, reason: pricing.source });
             continue;
           }
+          if (!freshQuote(pricing.timestamp)) {
+            results.push({id:fly.id,skipped:true,reason:"Quote timestamp missing or stale"});
+            continue;
+          }
           const multiplier = getMultiplier(fly.symbol);
           const pnl = (pricing.midDebit - fly.entryDebit) * multiplier * fly.contracts;
           const profitPct = pnl / fly.maxProfit;
@@ -273,7 +285,8 @@ export async function registerRoutes(
           results.push({ id: fly.id, error: err instanceof Error ? err.message : String(err) });
         }
       }
-      res.json({ checked: openFlies.length, results });
+      const degraded=results.some(r=>r.error || r.skipped);
+      res.status(degraded?503:200).json({ checked: openFlies.length, degraded, results });
     } catch (err) {
       next(err);
     }
@@ -628,6 +641,12 @@ export async function registerRoutes(
   app.put("/api/settings", async (req, res, next) => {
     try {
       const typed = insertSettingsSchema.partial().parse(req.body);
+      if(typed.autoTradeEnabled===true) {
+        const status=await workerStatus();
+        if(paperMode()!=="paper" || !status.healthy || !status.operatorConfigured) {
+          return res.status(409).json({message:"Entry cannot be armed until paper-write mode, operator authentication, and a healthy worker are verified."});
+        }
+      }
       // Cross-field checks need the stored mode when the client sends only a value.
       const current = await storage.getSettings();
       const merged = { ...typed } as Record<string, unknown>;
@@ -685,7 +704,7 @@ export async function registerRoutes(
           }
 
           const mid = pricing?.midDebit;
-          if (mid === null || mid === undefined) {
+          if (!Number.isFinite(mid) || mid < 0 || !freshQuote(pricing?.timestamp)) {
             return {
               id: fly.id,
               symbol: fly.symbol,
@@ -696,7 +715,7 @@ export async function registerRoutes(
               entryDebit: fly.entryDebit,
               dte,
               priced: false,
-              reason: pricingError ?? pricing?.source ?? "no quote available",
+              reason: pricingError ?? "Quote unavailable, stale, or missing a timezone-qualified timestamp",
               // Explicit so an unpriceable position can never be read as "no exit needed".
               fires: null,
             };
@@ -723,6 +742,7 @@ export async function registerRoutes(
             dte,
             priced: true,
             source: pricing.source,
+            quoteTimestamp: pricing.timestamp,
             spot: pricing.spot,
             midDebit: Math.round(mid * 100) / 100,
             unrealizedPnl: Math.round(pnl * 100) / 100,

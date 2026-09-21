@@ -512,6 +512,10 @@ export function buildProposal(
       considered.push({ ...base, rejected: "one or both wing strikes are not listed" });
       continue;
     }
+    if([lower,bodyLeg,upper].some(leg=>!Number.isFinite(leg.bid) || !Number.isFinite(leg.ask) || leg.bid<0 || leg.ask<=0 || leg.ask<leg.bid)) {
+      considered.push({...base,rejected:"missing, invalid, or crossed bid/ask on a leg"});
+      continue;
+    }
     // Long butterfly: buy one of each wing, sell two bodies. Priced off mids; a
     // zero or negative mid means the feed has no usable two-sided market.
     if (!(lower.mid > 0) || !(upper.mid > 0) || !(bodyLeg.mid > 0)) {

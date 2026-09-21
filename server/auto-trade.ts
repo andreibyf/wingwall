@@ -16,6 +16,8 @@ import { buildProposal, branchPolicy, type FlyProposal, type BranchPolicy } from
 import { analyzeChain, MONDAY_TO_THURSDAY_TRADING_DAYS, type ChainFn, type ChainData } from "./chain-analysis";
 import { resolveExitPolicy, type ExitPolicy } from "../shared/exit-policy";
 import { callModelOnce } from "./copilot";
+import { entryWindow, eastern, freshQuote, remainingSessions, paperMode } from "./automation-policy";
+import { commitPaperEntry } from "./paper-ledger";
 
 export interface GatekeeperVerdict {
   approved: boolean;
@@ -29,6 +31,7 @@ export interface GatekeeperVerdict {
 
 export type AutoTradeOutcome =
   | "entered"
+  | "would_enter"
   | "declined_by_model"
   | "no_proposal"
   | "disabled"
@@ -97,13 +100,9 @@ export function parseVerdict(text: string, model: string): GatekeeperVerdict {
   let body = text.trim();
   const fence = body.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
   if (fence) body = fence[1].trim();
-  const start = body.indexOf("{");
-  const end = body.lastIndexOf("}");
-  if (start === -1 || end === -1 || end <= start) return decline("no JSON object in the response");
-
   let parsed: any;
   try {
-    parsed = JSON.parse(body.slice(start, end + 1));
+    parsed = JSON.parse(body);
   } catch (err) {
     return decline(`response was not valid JSON: ${(err as Error).message}`);
   }
@@ -113,6 +112,8 @@ export function parseVerdict(text: string, model: string): GatekeeperVerdict {
   }
   const rationale = typeof parsed.rationale === "string" ? parsed.rationale.trim() : "";
   if (!rationale) return decline("the 'rationale' field was missing or empty");
+  if(!["high","medium","low"].includes(parsed.confidence) || !Array.isArray(parsed.concerns) ||
+    !parsed.concerns.every((value:unknown)=>typeof value==="string")) return decline("confidence or concerns did not match the verdict schema");
 
   const confidence =
     parsed.confidence === "high" || parsed.confidence === "medium" || parsed.confidence === "low"
@@ -152,7 +153,7 @@ export async function runAutoTrade(
 ): Promise<AutoTradeRun> {
   const now = deps.now ?? new Date();
   const ranAt = now.toISOString();
-  const today = ranAt.slice(0, 10);
+  const today = eastern(now).date;
   const dryRun = opts.dryRun === true;
 
   const base: AutoTradeRun = {
@@ -181,11 +182,14 @@ export async function runAutoTrade(
   if (!enabled && !opts.ignoreToggle) {
     return { ...base, outcome: "disabled", detail: "Autonomous entry is switched off in Settings." };
   }
+  const window = entryWindow(now);
+  if (!window.allowed) return { ...base, outcome:"no_proposal", detail:window.reason };
+  if (!dryRun && paperMode() !== "paper") return { ...base, outcome:"disabled", detail:"Paper workers are in observation mode." };
 
   // One position at a time. Stacking a second fly on an open one doubles deployed capital
   // without any of the sizing arithmetic knowing it happened.
   const openFlies = allFlies.filter((f) => f.status === "open");
-  if (openFlies.length > 0 && !dryRun) {
+  if (openFlies.length > 0) {
     return {
       ...base,
       outcome: "already_open",
@@ -206,9 +210,10 @@ export async function runAutoTrade(
   // does not describe this week's market, so the branch is only honoured when its week
   // matches; otherwise there is no active branch and the engine stands down.
   const newestWall = walls
+    .filter(w => w.symbol === symbol)
     .slice()
     .sort((a, b) => (a.weekOf < b.weekOf ? 1 : a.weekOf > b.weekOf ? -1 : b.id - a.id))[0];
-  const keyingMonday = keyingMondayFor(today);
+  const keyingMonday = window.monday;
   const wallApplies = newestWall?.weekOf === keyingMonday;
   const branch = wallApplies ? newestWall?.activeBranch ?? null : null;
   const bp = branchPolicy(branch ?? "");
@@ -236,9 +241,10 @@ export async function runAutoTrade(
       detail: `Could not load the ${symbol} option chain: ${(err as Error).message}`,
     };
   }
+  if (!freshQuote(chain?.timestamp, now)) return { ...base, outcome:"no_proposal", detail:"Chain quote is missing a timezone-qualified timestamp or is more than two minutes old." };
 
   const cal = tradingWeek(today);
-  const analysis = analyzeChain(chain, cal.thursdayExpiration, MONDAY_TO_THURSDAY_TRADING_DAYS, today);
+  const analysis = analyzeChain(chain, cal.thursdayExpiration, remainingSessions(today,cal.thursdayExpiration), today);
   const proposal = buildProposal(
     chain,
     analysis,
@@ -271,7 +277,7 @@ export async function runAutoTrade(
       `<proposal>\n${JSON.stringify(proposal, null, 2)}\n</proposal>\n\n` +
       `The keyed branch is "${branch}". ${bp.note}\n\n` +
       `Approve or decline this structure as written.`;
-    const { text, model } = await ask(GATEKEEPER_SYSTEM, payload, 1200);
+    const { text, model } = await ask(GATEKEEPER_SYSTEM, payload, 8192);
     verdict = parseVerdict(text, model);
   } catch (err) {
     // A model outage must not become an unreviewed entry.
@@ -313,13 +319,17 @@ export async function runAutoTrade(
   if (dryRun) {
     return {
       ...base,
-      outcome: "entered",
+      outcome: "would_enter",
       detail: "Dry run: the structure was approved but nothing was opened.",
     };
   }
 
   // --- Enter, and journal the reasoning in the same run ---------------------
-  const fly = await storage.createFly({
+  const result = await commitPaperEntry({ settingsSnapshot:settings, wallSnapshot:newestWall,
+    ...(deps.now?{now:()=>deps.now!}:{}),
+    quoteTimestamp:chain!.timestamp,
+    journal:`Branch ${branch}. Model ${verdict.model}: ${verdict.rationale}. ${proposal.bodyRationale}. ${proposal.wingRationale}. ${proposal.sizingRationale}. Quote ${chain!.timestamp}. Simulated mid, no broker order or fill.`,
+    fly:{
     symbol: proposal.symbol,
     optionType: proposal.optionType!,
     structureType: "symmetric",
@@ -341,33 +351,15 @@ export async function runAutoTrade(
       `(${verdict.model}) approved with ${verdict.confidence} confidence.`,
     peakProfitPct: null,
     peakLossPct: null,
-  });
-  base.flyId = fly.id;
-
-  const note = await storage.createJournalNote({
-    date: today,
-    category: "general",
-    text:
-      `Autonomous entry — Fly ${fly.id}. ${proposal.optionType} ` +
-      `${proposal.lowerStrike}/${proposal.middleStrike}/${proposal.upperStrike} exp ` +
-      `${proposal.expiration}, ${proposal.contracts}x at $${proposal.entryDebit} ` +
-      `(risk $${proposal.maxLoss}, max profit $${proposal.maxProfit}). ` +
-      `Branch "${branch}": ${bp.note}\n\n` +
-      `WHY THIS STRUCTURE (selected in code, not by the model):\n` +
-      `- ${proposal.bodyRationale}\n` +
-      `- ${proposal.wingRationale}\n` +
-      `- ${proposal.sizingRationale}\n\n` +
-      `EXITS: ${proposal.thresholds?.note ?? "n/a"}\n\n` +
-      `RISK GATE (${verdict.model}, confidence ${verdict.confidence}): ${verdict.rationale}` +
-      (verdict.concerns.length ? `\nConcerns noted: ${verdict.concerns.join("; ")}` : ""),
-  });
-  base.journalNoteId = note.id;
+  }});
+  base.flyId = result.flyId;
+  base.journalNoteId = result.journalNoteId;
 
   return {
     ...base,
     outcome: "entered",
     detail:
-      `Opened Fly ${fly.id}: ${proposal.optionType} ` +
+      `Opened paper Fly ${result.flyId}: ${proposal.optionType} ` +
       `${proposal.lowerStrike}/${proposal.middleStrike}/${proposal.upperStrike}, ` +
       `${proposal.contracts}x at $${proposal.entryDebit}, $${proposal.maxLoss} at risk.`,
   };

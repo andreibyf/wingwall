@@ -48,7 +48,7 @@ test("provider errors propagate without automatic retries", async () => {
   }, 8192, "model"), { status: 429 });
   assert.equal(calls, 1);
 });
-test("actual chat request uses root-cause policy; gatekeeper request is unchanged", async () => {
+test("chat and gatekeeper use complete-response policy with sufficient thinking budget", async () => {
   const previous = { ...process.env };
   Object.assign(process.env, {
     DATABASE_URL: "postgresql://localhost/unused_copilot_test",
@@ -79,9 +79,16 @@ test("actual chat request uses root-cause policy; gatekeeper request is unchange
     assert.ok(requests[0].messages.every((m: any) => m.content !== "(empty response)"));
     assert.match(requests[0].messages.at(-1).content, /fresh-snapshot/);
     await callModelOnce("Gatekeeper", "Test only");
-    assert.equal(requests[1].max_tokens, 1200);
-    assert.equal(requests[1].thinking, undefined);
-    assert.equal(requests[1].output_config, undefined);
+    assert.equal(requests[1].max_tokens, 8192);
+    assert.deepEqual(requests[1].thinking, { type:"adaptive" });
+    assert.deepEqual(requests[1].output_config, { effort:"high" });
+    for(const response of [
+      {content:[{type:"text",text:'{"approved":true,"rationale":"truncated"}'}],stop_reason:"max_tokens"},
+      {content:[],stop_reason:"end_turn"},
+    ]) {
+      globalThis.fetch=async()=>new Response(JSON.stringify(response),{status:200});
+      await assert.rejects(callModelOnce("Gatekeeper","test"),{status:502});
+    }
   } finally {
     globalThis.fetch = realFetch;
     for (const name of ["DATABASE_URL", "COPILOT_API_KEY", "COPILOT_MODEL", "COPILOT_MAX_TOKENS", "ANTHROPIC_BASE_URL"]) {

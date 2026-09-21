@@ -14,6 +14,7 @@ import Settings from "@/pages/Settings";
 import { Shell } from "@/components/app/Shell";
 import { ExtremeTracker } from "@/components/app/ExtremeTracker";
 import { CopilotWidget } from "@/components/app/CopilotWidget";
+import { OperatorGate } from "@/components/app/OperatorGate";
 
 function AppRouter() {
   return (
@@ -36,6 +37,7 @@ function App() {
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
         <Toaster />
+        <OperatorGate>
         {/* Runs globally so peak-profit/peak-loss tracking continues on any tab, not just Cockpit. */}
         <ExtremeTracker />
         <Router hook={useHashLocation}>
@@ -43,6 +45,7 @@ function App() {
           {/* Floating chat, available on every tab rather than living on its own route. */}
           <CopilotWidget />
         </Router>
+        </OperatorGate>
       </TooltipProvider>
     </QueryClientProvider>
   );
