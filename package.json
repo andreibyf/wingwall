@@ -9,6 +9,7 @@
     "start": "NODE_ENV=production node dist/index.cjs",
     "check": "tsc",
     "test:db": "tsx --test tests/duplicate-walls.integration.test.ts",
+    "test:copilot": "tsx --test tests/copilot-response.test.ts",
     "db:push": "drizzle-kit push"
   },
   "dependencies": {

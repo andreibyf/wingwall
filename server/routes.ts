@@ -36,6 +36,7 @@ import {
   isCopilotConfigured,
   listCopilotModels,
   copilotModel,
+  copilotChatPolicy,
   describeApiKeyShape,
   type ChatMessage,
 } from "./copilot";
@@ -832,7 +833,7 @@ export async function registerRoutes(
   app.get("/api/copilot/status", (_req, res) => {
     // `key` carries shape-only facts (length, public prefix, stray-whitespace flags) to make
     // a 401 diagnosable. It never includes any part of the secret itself.
-    res.json({ configured: isCopilotConfigured(), model: copilotModel, key: describeApiKeyShape() });
+    res.json({ configured: isCopilotConfigured(), model: copilotModel, chatPolicy: copilotChatPolicy, key: describeApiKeyShape() });
   });
 
   // Diagnostic: which model ids the configured key can actually reach. Used to confirm
