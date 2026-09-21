@@ -1,5 +1,11 @@
 # Copilot empty responses: root-cause investigation
 
+Update: the user subsequently authorized the root-cause fix. PR #2 has been
+revised with explicit Sonnet 5 adaptive/high-effort thinking, an 8192-token minimum
+chat budget, and rejection of truncated answers without automatic retries.
+See [current verification](COPILOT-EMPTY-RESPONSE-QA.md). The text below records
+the investigation state before that authorization.
+
 Investigated September 21, 2026. PR #2 remains unmerged; no production settings,
 code, positions, or walls were changed during this investigation.
 

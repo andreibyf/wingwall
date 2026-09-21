@@ -1,58 +1,36 @@
-# Copilot empty-response recovery
+# Copilot root-cause fix verification
 
-## Investigation update
+## Implemented policy
 
-The subsequent direct-provider investigation reproduced token exhaustion with
-1,400 thinking tokens and zero answer characters. See
-[COPILOT-ROOT-CAUSE.md](COPILOT-ROOT-CAUSE.md) for the controlled comparison,
-provider message IDs, historical-evidence limits, and corrective recommendation.
-This PR is still unmerged and must be revised beyond mitigation before rollout.
+- Sonnet 5 chat explicitly requests adaptive thinking and high effort.
+- Chat defaults to 8192 output tokens, shared between reasoning and answer.
+  Legacy lower limits or invalid settings fall back to 8192; valid larger
+  configured budgets up to 128000 are honored.
+- No automatic second model request.
+- Only a nonempty text answer with `stop_reason: end_turn` is treated as complete.
+  Token-limited answers are withheld even when text is present.
+- Safe provider metadata is logged; thinking content is not.
+- Old assistant placeholders are filtered from outbound history; client Retry
+  preserves the unanswered user message.
+- `/api/copilot/status` exposes the effective `chatPolicy` for verification.
+- `callModelOnce`, the automated gatekeeper, and trading rules are unchanged.
+  The separate gatekeeper token-budget concern remains outside this chat fix.
 
-## Confirmed defect
+## Verification before merge
 
-The old chat handler converted upstream responses without text blocks into a
-successful `{ reply: "(empty response)" }`. The widget appended that literal
-placeholder to the conversation and sent it back on subsequent turns.
-The user's screenshot showed this behavior twice on follow-up messages.
+- 22 regression tests passed via `npm run test:copilot`.
+- Actual chat request assertions verify the 8192 budget, adaptive thinking,
+  high effort, snapshot preservation, and exactly one provider request.
+- Regression test verifies gatekeeper request remains at its existing 1200
+  default without added thinking/effort fields.
+- TypeScript, production build, and diff checks passed.
+- Prior desktop/mobile UI checks passed for error display, retry, and successful recovery.
+- Direct Anthropic test of the exact new policy returned HTTP 200 and
+  `stop_reason: end_turn`: 2284 output tokens, including 1491 thinking tokens,
+  and 2015 answer characters. Provider message ID:
+  `msg_011CfGjb7zhZoecQ6maJbDs4`. No automatic retry was used.
 
-The original provider payload was not retained, so its precise reason for
-returning no text is unknown. Token exhaustion is handled as one possible cause,
-not claimed as the established root cause.
-
-## Changes
-
-- Missing, blank, malformed, thinking-only, or placeholder answers raise a
-  retryable HTTP 502 instead of becoming assistant messages.
-- Only when an empty reply explicitly reports `stop_reason: max_tokens`, retry
-  once with a larger budget: at least 4096, at most 8192 tokens. An already larger
-  configured budget is not reduced. This retry can incur another provider charge.
-- Preserve the same fresh snapshot and history through that retry.
-- Remove old assistant placeholders from outbound conversation history.
-- Log only response metadata (stop reason, block types, output-token count,
-  budget, attempt). Never log response content or hidden reasoning in this helper.
-- Client rejects empty or malformed success payloads and preserves the user's
-  unanswered turn for Retry. Clear is disabled while a request is pending.
-- No model change, trading action, database change, or gatekeeper change.
-
-## Verification
-
-`npm run test:copilot`: 13 tests pass, covering malformed responses, text-only
-extraction, bounded retries, provider errors, and the actual chat follow-up
-request path with a mocked provider.
-
-`npm run check`, `npm run build`, and `git diff --check` pass.
-Existing build warnings concern PostCSS and bundle size.
-
-Playwright checks against isolated fixtures pass:
-
-- Legacy empty placeholder produces error UI, not an assistant bubble.
-- HTTP 502 is readable and retryable.
-- Repeated Retry requests preserve the original user turn exactly.
-- Successful retry shows the answer and clears the error.
-- Clear is disabled while pending.
-- Desktop 1280px and mobile 375px inspected; no horizontal overflow.
-
-These are deterministic regression tests, not a claim that the live provider
-issue was reproduced or repaired in production. After deployment, reload the
-widget and test a normal question followed by “yes.” If the upstream provider
-continues returning empty content, inspect the new metadata to diagnose it.
+See [the investigation](COPILOT-ROOT-CAUSE.md) for the earlier controlled
+reproduction and its historical-evidence limitations. This fix does not assert
+that every possible prompt will fit the budget; incomplete replies are surfaced
+as errors rather than silently shown as complete trading advice.

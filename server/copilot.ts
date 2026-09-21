@@ -18,7 +18,7 @@
 import type { Fly } from "@shared/schema";
 import { getMultiplier } from "@shared/flyMath";
 import { storage } from "./storage";
-import { requestCopilotReply } from "./copilot-response";
+import { requestCopilotReply, getCopilotChatPolicy } from "./copilot-response";
 import { analyzeChain, MONDAY_TO_THURSDAY_TRADING_DAYS, type ChainFn } from "./chain-analysis";
 import {
   resolveExitPolicy,
@@ -33,7 +33,7 @@ const ANTHROPIC_VERSION = "2023-06-01";
 
 // Overridable so the model can be repointed from the Render dashboard without a redeploy.
 const DEFAULT_MODEL = process.env.COPILOT_MODEL || "claude-haiku-4-5";
-const MAX_TOKENS = Number(process.env.COPILOT_MAX_TOKENS) || 1400;
+export const copilotChatPolicy = getCopilotChatPolicy(DEFAULT_MODEL, process.env.COPILOT_MAX_TOKENS);
 
 // Thresholds used to live here as a pair of constants that silently duplicated
 // shared/thresholds.ts without importing it, so changing one left the copilot quoting a
@@ -608,6 +608,7 @@ export async function runCopilotChat(
     },
     body: JSON.stringify({
       model: DEFAULT_MODEL,
+      ...copilotChatPolicy,
       max_tokens: maxTokens,
       system: SYSTEM_PROMPT,
       messages: payloadMessages,
@@ -631,7 +632,7 @@ export async function runCopilotChat(
   }
 
   return res.json();
-  }, MAX_TOKENS, DEFAULT_MODEL);
+  }, copilotChatPolicy.max_tokens, DEFAULT_MODEL);
 }
 
 /** Lists model ids the configured key can actually reach — used to verify setup. */
