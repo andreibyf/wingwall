@@ -166,7 +166,10 @@ export function CopilotWidget() {
     try {
       const res = await apiRequest("POST", "/api/copilot/chat", { messages: history });
       const data = await res.json();
-      setMessages([...history, { role: "assistant", content: data.reply }]);
+      if (typeof data?.reply !== "string" || !data.reply.trim() || data.reply.trim() === "(empty response)") {
+        throw new Error("The model returned no answer text. Please retry your last message.");
+      }
+      setMessages([...history, { role: "assistant", content: data.reply.trim() }]);
     } catch (err) {
       setError(readableError(err));
     } finally {
@@ -233,6 +236,7 @@ export function CopilotWidget() {
                     setError(null);
                   }}
                   aria-label="Clear conversation"
+                  disabled={pending}
                   data-testid="button-copilot-clear"
                   className="rounded-md p-1.5 text-muted-foreground hover-elevate"
                 >

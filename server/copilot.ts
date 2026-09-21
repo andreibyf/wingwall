@@ -18,6 +18,7 @@
 import type { Fly } from "@shared/schema";
 import { getMultiplier } from "@shared/flyMath";
 import { storage } from "./storage";
+import { requestCopilotReply } from "./copilot-response";
 import { analyzeChain, MONDAY_TO_THURSDAY_TRADING_DAYS, type ChainFn } from "./chain-analysis";
 import {
   resolveExitPolicy,
@@ -577,7 +578,10 @@ export async function runCopilotChat(
   const apiKey = readApiKey();
   if (!apiKey) throw Object.assign(new Error("Copilot is not configured"), { status: 503 });
 
-  const history = messages.slice(-16).filter((m) => m.content.trim().length > 0);
+  const history = messages.filter((m) =>
+    m.content.trim().length > 0 &&
+    !(m.role === "assistant" && m.content.trim() === "(empty response)")
+  ).slice(-16);
   if (history.length === 0) {
     throw Object.assign(new Error("At least one message is required"), { status: 400 });
   }
@@ -594,6 +598,7 @@ export async function runCopilotChat(
       : { role: m.role, content: m.content },
   );
 
+  return requestCopilotReply(async (maxTokens) => {
   const res = await fetch(`${ANTHROPIC_BASE}/messages`, {
     method: "POST",
     headers: {
@@ -603,7 +608,7 @@ export async function runCopilotChat(
     },
     body: JSON.stringify({
       model: DEFAULT_MODEL,
-      max_tokens: MAX_TOKENS,
+      max_tokens: maxTokens,
       system: SYSTEM_PROMPT,
       messages: payloadMessages,
     }),
@@ -625,16 +630,8 @@ export async function runCopilotChat(
     });
   }
 
-  const data = await res.json();
-  const reply = Array.isArray(data?.content)
-    ? data.content
-        .filter((b: any) => b?.type === "text")
-        .map((b: any) => b.text)
-        .join("")
-        .trim()
-    : "";
-
-  return { reply: reply || "(empty response)", model: data?.model ?? DEFAULT_MODEL };
+  return res.json();
+  }, MAX_TOKENS, DEFAULT_MODEL);
 }
 
 /** Lists model ids the configured key can actually reach — used to verify setup. */
