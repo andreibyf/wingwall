@@ -101,6 +101,32 @@ CREATE TABLE IF NOT EXISTS journal_notes (
   text TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS strategy_reviews (
+  id SERIAL PRIMARY KEY, symbol TEXT NOT NULL, strategy TEXT NOT NULL,
+  payload JSONB NOT NULL, version TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS strategy_reviews_latest ON strategy_reviews(symbol,strategy,id DESC);
+CREATE TABLE IF NOT EXISTS spread_plans (
+  id SERIAL PRIMARY KEY, payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS spread_rules (
+  plan_id INTEGER PRIMARY KEY REFERENCES spread_plans(id), payload JSONB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS spread_positions (
+  id SERIAL PRIMARY KEY,plan_id INTEGER NOT NULL REFERENCES spread_plans(id),layer_index INTEGER NOT NULL,
+  symbol TEXT NOT NULL,contracts INTEGER NOT NULL,entry_debit DOUBLE PRECISION NOT NULL,entry_fees DOUBLE PRECISION NOT NULL,
+  opened_at TIMESTAMPTZ NOT NULL,entry_evidence JSONB NOT NULL,status TEXT NOT NULL DEFAULT 'open',
+  mark_credit DOUBLE PRECISION,mark_at TIMESTAMPTZ,exit_credit DOUBLE PRECISION,realized_pnl DOUBLE PRECISION,
+  closed_at TIMESTAMPTZ,exit_reason TEXT,UNIQUE(plan_id,layer_index)
+);
+CREATE TABLE IF NOT EXISTS spread_decisions (
+  id SERIAL PRIMARY KEY,plan_id INTEGER NOT NULL,action TEXT NOT NULL,detail JSONB NOT NULL,
+  decision_key TEXT UNIQUE,created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS trade_reflections (
+  id SERIAL PRIMARY KEY,position_id INTEGER NOT NULL REFERENCES spread_positions(id),text TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 `);
 
   // Additive migration: older databases predate the peak-tracking columns.
@@ -216,6 +242,9 @@ ALTER TABLE gex_levels_cache ALTER COLUMN gamma_flip TYPE DOUBLE PRECISION;
 ALTER TABLE gex_levels_cache ALTER COLUMN spot TYPE DOUBLE PRECISION;
 ALTER TABLE gex_levels_cache ALTER COLUMN net_gex_oi TYPE DOUBLE PRECISION;
 `);
+  // Explicit deployment lock: fail startup if the requested disarm cannot persist.
+  if(process.env.PAPER_ENTRY_ENABLED==="false")
+    await pool.query("UPDATE settings SET auto_trade_enabled=false WHERE id=1");
 }
 
 /**
@@ -400,11 +429,18 @@ export class DatabaseStorage implements IStorage {
   }
 
   async createFly(fly: InsertFly): Promise<Fly> {
-    const rows = await db
-      .insert(flies)
-      .values({ ...fly, createdAt: new Date().toISOString() })
-      .returning();
-    return rows[0];
+    const {assertButterflyReview}=await import("./strategy-store");
+    return db.transaction(async tx=>{
+      await tx.execute(sql`LOCK TABLE flies, strategy_reviews, spread_positions IN SHARE ROW EXCLUSIVE MODE`);
+      if((fly.status??"open")!=="closed") {
+        if((await tx.execute(sql`SELECT 1 FROM spread_positions WHERE status='open' LIMIT 1`)).rows.length)
+          throw Object.assign(Error("Paper spreads are open; close them before starting a butterfly campaign"),{status:409});
+        const review=await assertButterflyReview(fly.symbol,new Date(),tx);
+        fly={...fly,notes:`${fly.notes??""}\nMentor checklist review ${review.id}; operator paper entry.`};
+      }
+      const [row]=await tx.insert(flies).values({...fly,createdAt:new Date().toISOString()}).returning();
+      return row;
+    });
   }
 
   async updateFly(id: number, fly: Partial<InsertFly>): Promise<Fly | undefined> {
@@ -413,6 +449,9 @@ export class DatabaseStorage implements IStorage {
       const [current]=await tx.select().from(flies).where(eq(flies.id,id));
       if(!current) return undefined;
       if(current.status==="closed" && fly.status==="open") throw Object.assign(new Error("Closed positions cannot be reopened"),{status:409});
+      const exposureFields=["symbol","optionType","structureType","expiration","lowerStrike","middleStrike","upperStrike","contracts","entryDebit","maxLoss","maxProfit"] as const;
+      if(current.status==="open" && exposureFields.some(k=>fly[k]!==undefined && fly[k]!==current[k]))
+        throw Object.assign(new Error("Open-position exposure is immutable. Close and create a reviewed replacement; checklist gates cannot be bypassed by editing."),{status:409});
       if(fly.status==="closed" && current.status==="closed") return current;
       if(fly.status==="closed" && (!Number.isFinite(fly.exitDebit) || Number(fly.exitDebit)<0 || !fly.exitDate)) throw Object.assign(new Error("Closing requires a nonnegative exit debit and exit date"),{status:400});
       const [updated]=await tx.update(flies).set(fly).where(eq(flies.id,id)).returning();
@@ -511,6 +550,8 @@ export class DatabaseStorage implements IStorage {
   }
 
   async updateSettings(s: Partial<InsertSettings>): Promise<Settings> {
+    if(s.autoTradeEnabled===true && process.env.PAPER_ENTRY_ENABLED==="false")
+      throw Object.assign(Error("Entries are locked off by deployment configuration"),{status:409});
     await this.getSettings();
     const rows = await db.update(settings).set(s).where(eq(settings.id, 1)).returning();
     return rows[0];

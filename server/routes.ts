@@ -30,6 +30,7 @@ import { z } from "zod";
 import { runAutoTrade, tradingWeek } from "./auto-trade";
 import { freshQuote, paperMode } from "./automation-policy";
 import { workerStatus } from "./paper-worker";
+import { registerStrategyRoutes } from "./strategy-store";
 import { resolveExitPolicy, assessThresholdReachability } from "@shared/exit-policy";
 import { getIbkrFlyQuote, isIbkrSupported, IbkrPricingError } from "./ibkr";
 import {
@@ -207,6 +208,7 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
+  registerStrategyRoutes(app);
   app.get("/api/automation/status",async(_req,res,next)=>{
     try {res.json(await workerStatus());} catch(err){next(err);}
   });

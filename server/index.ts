@@ -75,7 +75,7 @@ app.use((req, res, next) => {
   app.get("/health/automation",async(_req,res)=>{
     try {
       const status=await workerStatus();
-      res.status(status.healthy?200:503).json({healthy:status.healthy,heartbeatFresh:status.heartbeatFresh,mode:status.mode});
+      res.status(status.healthy?200:503).json({healthy:status.healthy,heartbeatFresh:status.heartbeatFresh,mode:status.mode,entryArmed:status.entryArmed,entryLocked:status.entryLocked});
     } catch {res.status(503).json({healthy:false});}
   });
 

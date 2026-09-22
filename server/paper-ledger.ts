@@ -3,6 +3,7 @@ import { db } from "./storage";
 import { flies, journalNotes, settings, campaignWalls, type InsertFly } from "../shared/schema";
 import { entryWindow, freshQuote, paperMode, eastern, exitReason } from "./automation-policy";
 import { operatorConfigured } from "./operator-auth";
+import { assertButterflyReview } from "./strategy-store";
 
 const fail=(message:string)=>Object.assign(new Error(message),{status:409});
 export async function commitPaperEntry(input:{
@@ -11,9 +12,9 @@ export async function commitPaperEntry(input:{
 }) {
   return db.transaction(async tx=>{
     // Locks also serialize with manual INSERT/PATCH/DELETE endpoints, not just workers.
-    await tx.execute(sql`LOCK TABLE settings, campaign_walls, flies IN SHARE ROW EXCLUSIVE MODE`);
+    await tx.execute(sql`LOCK TABLE settings, campaign_walls, flies, strategy_reviews, spread_positions IN SHARE ROW EXCLUSIVE MODE`);
     const now=(input.now??(()=>new Date()))(), window=entryWindow(now);
-    if(paperMode()!=="paper" || !operatorConfigured() || !window.allowed || !freshQuote(input.quoteTimestamp,now)) throw fail("Paper entry no longer authorized, in-window, or fresh");
+    if(process.env.PAPER_ENTRY_ENABLED==="false" || paperMode()!=="paper" || !operatorConfigured() || !window.allowed || !freshQuote(input.quoteTimestamp,now)) throw fail("Paper entry no longer authorized, in-window, or fresh");
     const [current]=await tx.select().from(settings).where(eq(settings.id,1));
     if(!current?.autoTradeEnabled || JSON.stringify(current)!==JSON.stringify(input.settingsSnapshot)) throw fail("Settings changed or entry disarmed during review");
     if(!Number.isFinite(input.fly.maxLoss) || input.fly.maxLoss<=0 ||
@@ -24,13 +25,15 @@ export async function commitPaperEntry(input:{
     if(!wall || wall.symbol!==input.fly.symbol || wall.weekOf!==window.monday || JSON.stringify(wall)!==JSON.stringify(input.wallSnapshot)) throw fail("Campaign changed during review");
     const existing=await tx.select().from(flies);
     if(existing.some(f=>f.status==="open")) throw fail("A position is already open");
+    if((await tx.execute(sql`SELECT 1 FROM spread_positions WHERE status='open' LIMIT 1`)).rows.length)throw fail("Paper spreads are already open; no new butterfly campaign");
     if(existing.some(f=>f.symbol===input.fly.symbol && f.entryDate>=window.monday && f.entryDate<=window.expiration)) throw fail("An entry already exists this campaign week");
     const claimed=await tx.execute(sql`SELECT 1 FROM paper_entry_claims WHERE symbol=${input.fly.symbol} AND week_of=${window.monday}`);
     if(claimed.rows.length) throw fail("Campaign entry already claimed");
     if(input.fly.expiration!==window.expiration || input.fly.entryDate!==window.date) throw fail("Proposal date no longer current");
+    const review=await assertButterflyReview(input.fly.symbol,now,tx);
     const [fly]=await tx.insert(flies).values({...input.fly,createdAt:now.toISOString()}).returning();
     await tx.execute(sql`INSERT INTO paper_entry_claims(symbol,week_of,fly_id) VALUES(${fly.symbol},${window.monday},${fly.id})`);
-    const [note]=await tx.insert(journalNotes).values({date:window.date,category:"general",text:`Paper entry Fly ${fly.id}. ${input.journal}`,createdAt:now.toISOString()}).returning();
+    const [note]=await tx.insert(journalNotes).values({date:window.date,category:"general",text:`Paper entry Fly ${fly.id}, mentor review ${review.id}. ${input.journal}`,createdAt:now.toISOString()}).returning();
     return {flyId:fly.id,journalNoteId:note.id};
   });
 }

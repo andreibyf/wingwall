@@ -131,7 +131,7 @@ export default function Settings() {
       toast({
         title: next ? "Autonomous entry armed" : "Autonomous entry off",
         description: next
-          ? "The scheduled run may now open one position per week without asking."
+          ? "Master paper entry switch armed. Butterfly campaigns and explicitly enabled spread plans still require paper mode, current evidence, fresh quotes and risk checks."
           : "New entries are disabled. Exit monitoring is independent.",
       });
     } catch (err) {
@@ -346,10 +346,10 @@ export default function Settings() {
               <ShieldCheck className="h-4 w-4" /> Autonomous entry
             </h2>
             <p className="mt-1 text-xs text-muted-foreground">
-              When armed, the scheduled run may open one position on the keyed branch without
-              asking. Strikes and size are chosen in code; a model reviews the finished structure
-              and can only approve or decline it. Anything unexpected — no keyed wall for the
-              current week, a position already open, an unreadable review — results in no trade.
+              Master switch for paper entries. The butterfly engine may open one reviewed campaign
+              per week. Spread plans additionally require explicit numeric automation rules in Strategy.
+              Both require paper mode, current checklist evidence, fresh quotes and risk checks.
+              Turning this off stops new entries, not exits. Observe mode never creates fills.
             </p>
           </div>
           <Switch
@@ -366,7 +366,7 @@ export default function Settings() {
           </Badge>
           {openFlies.length > 0 && (
             <Badge variant="outline">
-              {openFlies.length} open — entry will not stack
+              {openFlies.length} open butterfly — no additional butterfly entry
             </Badge>
           )}
         </div>
@@ -374,7 +374,7 @@ export default function Settings() {
         <div className="mt-4">
           <Button variant="outline" size="sm" onClick={runPreview} disabled={previewing} data-testid="button-preview-auto-trade">
             {previewing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Play className="mr-2 h-4 w-4" />}
-            Preview what it would do
+            Preview butterfly decision
           </Button>
           <p className="mt-1.5 text-xs text-muted-foreground">
             Runs the full engine against the live chain and writes nothing, whether or not it is
