@@ -20,8 +20,10 @@ export async function strategySnapshot() {
   const reviews=await db.execute(sql`SELECT DISTINCT ON(symbol,strategy) id,payload,created_at AS "createdAt",version
     FROM strategy_reviews ORDER BY symbol,strategy,id DESC`);
   const plans=await db.execute(sql`SELECT id,payload,created_at AS "createdAt" FROM spread_plans ORDER BY id DESC LIMIT 20`);
+  const drafts=await db.execute(sql`SELECT id,payload,created_at AS "createdAt",updated_at AS "updatedAt",version
+    FROM recommendation_drafts ORDER BY id DESC LIMIT 10`);
   return {reviews:reviews.rows.map((r:any)=>({...r,...r.payload,current:currentReview(r),assessment:evaluateReview(r.payload)})),
-    plans:plans.rows,learning:await learningSnapshot(),spreadExecution:"Saved plans are not positions. Explicit numeric paper rules plus master switch, paper mode, current review and fresh quotes are required. Exits run independently of entry arming."};
+    plans:plans.rows,recommendationDrafts:drafts.rows,learning:await learningSnapshot(),spreadExecution:"Saved plans are not positions. Explicit numeric paper rules plus master switch, paper mode, current review and fresh quotes are required. Exits run independently of entry arming."};
 }
 export function registerStrategyRoutes(app:Express) {
   registerLearningRoutes(app);

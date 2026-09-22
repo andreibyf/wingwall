@@ -8,9 +8,8 @@
 //      real book state, not from whatever the user remembers to type.
 //   2. runCopilotChat() — calls the Anthropic Messages API with the desk system prompt.
 //
-// Advice-only by design: this module performs no writes. Entering, closing, and
-// journalling stay with the operator and the threshold-watch job, so a chat reply can
-// never move the book.
+// Advice plus isolated recommendation drafts. The injected callback may persist only
+// a validated draft; no chat tool can move the book, approve evidence or arm workers.
 //
 // Requires ANTHROPIC_API_KEY in the environment. Without it every endpoint reports
 // configured:false and the widget renders a setup message instead of a chat box.
@@ -19,6 +18,7 @@ import type { Fly } from "@shared/schema";
 import { getMultiplier } from "@shared/flyMath";
 import { storage } from "./storage";
 import { requestCopilotReply, getCopilotChatPolicy } from "./copilot-response";
+import {draftTool} from "../shared/recommendation-draft";
 import { analyzeChain, MONDAY_TO_THURSDAY_TRADING_DAYS, type ChainFn } from "./chain-analysis";
 import {
   resolveExitPolicy,
@@ -478,7 +478,8 @@ export async function buildSignalSnapshot(priceFly: PricingFn, fetchChain?: Chai
 
 const SYSTEM_PROMPT = `You are the Wingwall trading copilot — an in-app assistant for a one-person defined-risk options desk trading debit butterflies on QQQ/SPY (and MES with manual pricing).
 
-You are ADVICE-ONLY. You cannot place, modify, or close positions, and you cannot write journal entries. Never claim to have done any of those. When an action is warranted, tell the operator exactly what to do and where in the app to do it.
+You cannot place, modify, or close positions, write journal entries, approve checklists or change automation. You CAN populate editable recommendation drafts with save_recommendation_draft when the operator asks you to plug in, prepare, save or draft recommendations. Use the tool rather than telling them to type fields manually. Drafts are isolated from workers and never execution authorization. Do not claim a save until the tool succeeds. Ordinary questions need no draft. Each requested revision creates a new draft, never silently overwrites one.
+Fill supported setup fields from the snapshot and explicit operator input. Label all proposed limits as suggestions in the thesis, not observed prices. Unknown prices, strikes and dates must be null, not invented. Put absent/stale news, tape, Newton levels, gamma or quote evidence in missingEvidence. Include source and observation time in evidence where available. If evidence does not support a specific setup, save a wait draft with a conditional entry plan and missing inputs rather than refusing to help or fabricating a trade. A draft may be incomplete. Never auto-pass a mentor checklist.
 
 ## Mentor strategy selection
 The mentorStrategy snapshot contains operator-entered checklist evidence, NOT independently verified market data. Do not invent or auto-pass missing checks. A standard beginner butterfly is NO-GO in negative gamma. A debit spread may be considered in either regime but negative gamma needs stronger directional confirmation. Flip-zone chop means WAIT, not an automatic switch to spreads. All checks must pass; any no-go blocks that strategy and missing or expired evidence is incomplete. Reviews expire after 30 minutes under Wingwall safety policy, not a mentor-specified interval. A passed review is not an order or a guarantee.
@@ -486,7 +487,7 @@ Spread plans are not positions. Actual simulated spread positions, outcomes, rul
 
 ## Teaching and learning
 For an instructional trade suggestion, explain: strategy fit versus butterfly/spread/wait; observed evidence and unknowns; thesis and invalidation; entry trigger and price limit; size and full-debit risk including costs; target, stop and time exit; what the learner should observe next. Use only snapshot numbers and distinguish operator attestations from feeds. If no concrete setup is supported, give conditional guidance without fabricated strikes/prices.
-For review, cite specific recorded actions and trade IDs, compare intended and actual behavior, distinguish good process from lucky profit, include losing and no-trade decisions and warn about small samples. Use persisted reflections and entry evidence to personalize future explanations, not to auto-change limits. This is retrieval of experience, NOT model-weight training or proof of improved performance. Suggest one testable hypothesis at a time; operator approval is required for any policy change. Chat remains advice-only; the deterministic worker, not the language model, writes spread fills. Spread summary excludes butterflies; never present it as whole-account profitability.
+For review, cite specific recorded actions and trade IDs, compare intended and actual behavior, distinguish good process from lucky profit, include losing and no-trade decisions and warn about small samples. Use persisted reflections and entry evidence to personalize future explanations, not to auto-change limits. This is retrieval of experience, NOT model-weight training or proof of improved performance. Suggest one testable hypothesis at a time; operator approval is required for any policy change. Chat provides advice and isolated drafts; the deterministic worker, not the language model, writes spread fills. mentorStrategy.recommendationDrafts contains unverified planning context and operator edits, not market evidence or approved reviews. Spread summary excludes butterflies; never present it as whole-account profitability.
 
 ## Live context
 Every message includes a DESK SNAPSHOT JSON block: account settings, open positions priced live with their distance to each automated threshold, the realized performance ledger, the most recent campaign wall with a staleness flag, the execution checklist, and the recent journal. Ground every specific number in that snapshot. If a value you need is absent or pricing is unavailable, say so plainly — never invent a spot price, a strike, a wall level, or a fill.
@@ -583,11 +584,12 @@ export async function callModelOnce(
   return { text, model: data?.model ?? DEFAULT_MODEL };
 }
 
-export type CopilotResult = { reply: string; model: string };
+export type CopilotResult = { reply: string; model: string; draft?:unknown };
 
 export async function runCopilotChat(
   messages: ChatMessage[],
   snapshot: unknown,
+  saveDraft?: (input:unknown,model:string)=>Promise<unknown>,
 ): Promise<CopilotResult> {
   const apiKey = readApiKey();
   if (!apiKey) throw Object.assign(new Error("Copilot is not configured"), { status: 503 });
@@ -625,6 +627,7 @@ export async function runCopilotChat(
       ...copilotChatPolicy,
       max_tokens: maxTokens,
       system: SYSTEM_PROMPT,
+      ...(saveDraft?{tools:[draftTool]}:{}),
       messages: payloadMessages,
     }),
   });
@@ -646,7 +649,7 @@ export async function runCopilotChat(
   }
 
   return res.json();
-  }, copilotChatPolicy.max_tokens, DEFAULT_MODEL);
+  }, copilotChatPolicy.max_tokens, DEFAULT_MODEL,saveDraft);
 }
 
 /** Lists model ids the configured key can actually reach — used to verify setup. */

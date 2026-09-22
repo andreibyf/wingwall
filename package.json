@@ -9,7 +9,7 @@
     "start": "NODE_ENV=production node dist/index.cjs",
     "check": "tsc",
     "test:db": "tsx --test tests/duplicate-walls.integration.test.ts",
-    "test:copilot": "tsx --test tests/copilot-response.test.ts",
+    "test:copilot": "tsx --test tests/copilot-response.test.ts tests/recommendation-drafts.test.ts",
     "test:automation": "tsx --test tests/automation-policy.test.ts tests/paper-automation.integration.test.ts",
     "test:strategy": "tsx --test tests/strategy-policy.test.ts",
     "test:learning": "tsx --test tests/paper-learning.test.ts",

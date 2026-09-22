@@ -3,6 +3,7 @@ import {useQuery,useMutation} from "@tanstack/react-query";
 import {apiRequest,queryClient} from "@/lib/queryClient";
 import {Button} from "@/components/ui/button";
 import {PaperLearning} from "@/components/app/PaperLearning";
+import {RecommendationDrafts} from "@/components/app/RecommendationDrafts";
 import {CHECKLISTS,reviewSchema,evaluateReview,layerPlanSchema,calculateLayerPlan,REVIEW_MINUTES,type Strategy as StrategyType,type ReviewInput,type LayerPlan} from "@shared/strategy-policy";
 
 const field="w-full rounded-md border border-input bg-background p-2 text-sm";
@@ -28,6 +29,7 @@ export default function Strategy(){
       <h2 className="text-xl font-semibold">Choose the setup. Keep “wait” available.</h2>
       <p className="max-w-3xl text-sm text-muted-foreground">Gamma first, then direction, path and payoff. A butterfly no-go is not a debit-spread approval. Unknown evidence stays unknown; the app does not infer live readings from checked boxes.</p>
     </div>
+    <RecommendationDrafts/>
     <div className="grid gap-4 md:grid-cols-3">
       <div className={panel}><h3 className="font-semibold text-sm">Butterfly</h3><p className="text-sm text-muted-foreground">Positive gamma and stable price behavior. Negative gamma blocks the standard beginner setup.</p></div>
       <div className={panel}><h3 className="font-semibold text-sm">Debit spread</h3><p className="text-sm text-muted-foreground">Directional thesis and room to the short strike. Negative gamma requires stronger confirmation, not a free pass.</p></div>

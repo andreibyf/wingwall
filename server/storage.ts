@@ -36,6 +36,12 @@ CREATE TABLE IF NOT EXISTS users (
   username TEXT NOT NULL UNIQUE,
   password TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS recommendation_drafts (
+  id SERIAL PRIMARY KEY, request_id TEXT NOT NULL UNIQUE,
+  payload JSONB NOT NULL, original_payload JSONB NOT NULL, model TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS flies (
   id SERIAL PRIMARY KEY,
   symbol TEXT NOT NULL,

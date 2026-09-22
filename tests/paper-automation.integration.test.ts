@@ -38,6 +38,7 @@ before(async()=>{
   base=`http://127.0.0.1:${(server.address() as any).port}`;
 });
 beforeEach(async()=>{
+  await sql.query("TRUNCATE recommendation_drafts RESTART IDENTITY");
   delete process.env.PAPER_ENTRY_ENABLED;
   process.env.PAPER_AUTOMATION_MODE="paper";delete process.env.PAPER_EXIT_ENABLED;
   process.env.WINGWALL_OPERATOR_PASSWORD="integration-only-passphrase";
@@ -64,6 +65,57 @@ async function login(){
   const r=await fetch(`${base}/api/auth/login`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({password:"integration-only-passphrase"})});
   assert.equal(r.status,200);return r.headers.get("set-cookie")!.split(";")[0];
 }
+test("recommendation drafts persist idempotently, edit with version checks and never touch trading state",async()=>{
+  const {saveRecommendationDraft}=await import("../server/recommendation-drafts");
+  const draft={title:"Conditional draft",symbol:"QQQ",strategy:"wait",direction:"unknown",thesis:"Need evidence",
+    entryCondition:"Confirm",exitPlan:"Unset",invalidation:"No confirmation",riskCap:null,suggestedDebit:null,
+    targetCredit:null,stopCredit:null,legs:[],evidence:[],missingEvidence:["Tape"]};
+  process.env.PAPER_AUTOMATION_MODE="observe";process.env.PAPER_ENTRY_ENABLED="false";
+  await storage.updateSettings({autoTradeEnabled:false});
+  const id=crypto.randomUUID();
+  const rows=await Promise.all([saveRecommendationDraft(draft,id,"fixture"),saveRecommendationDraft(draft,id,"fixture")]);
+  assert.equal(rows[0]?.id,rows[1]?.id);
+  const cookie=await login();
+  assert.equal((await fetch(`${base}/api/copilot/drafts`)).status,401);
+  const drafts=await (await fetch(`${base}/api/copilot/drafts`,{headers:{cookie}})).json();
+  assert.equal(drafts.length,1);assert.equal(drafts[0].payload.riskCap,null);
+  const path=`${base}/api/copilot/drafts/${drafts[0].id}`;
+  const opts={method:"PATCH",headers:{"content-type":"application/json",cookie},body:JSON.stringify({version:1,payload:{...draft,title:"My edited thesis"}})};
+  assert.equal((await fetch(path,{...opts,headers:{"content-type":"application/json"}})).status,401);
+  assert.equal((await fetch(path,opts)).status,200);
+  assert.equal((await fetch(path,opts)).status,409);
+  const saved=(await sql.query("SELECT * FROM recommendation_drafts")).rows[0];
+  assert.equal(saved.payload.title,"My edited thesis");assert.deepEqual(saved.original_payload,draft);
+  for(const table of ["flies","spread_positions","spread_plans","spread_rules","journal_notes"])
+    assert.equal((await sql.query(`SELECT count(*) FROM ${table}`)).rows[0].count,"0");
+  assert.equal((await storage.getSettings()).autoTradeEnabled,false);
+  assert.equal(process.env.PAPER_AUTOMATION_MODE,"observe");
+});
+test("chat sends only the draft tool and persists a validated model proposal",async()=>{
+  const {runCopilotChat}=await import("../server/copilot");
+  const {saveRecommendationDraft}=await import("../server/recommendation-drafts");
+  const originalFetch=globalThis.fetch,oldKey=process.env.COPILOT_API_KEY;
+  process.env.COPILOT_API_KEY="fixture-only-not-a-secret";
+  const draft={title:"WAIT fixture",symbol:"SPY",strategy:"wait",direction:"unknown",thesis:"Evidence absent",
+    entryCondition:"Verify first",exitPlan:"Unset",invalidation:"Missing evidence",riskCap:null,suggestedDebit:null,
+    targetCredit:null,stopCredit:null,legs:[],evidence:[],missingEvidence:["Fresh quotes"]};
+  try {
+    globalThis.fetch=async(_url,init)=>{
+      const body=JSON.parse(String(init?.body));
+      assert.deepEqual(body.tools.map((t:any)=>t.name),["save_recommendation_draft"]);
+      assert.match(body.system,/Unknown prices, strikes and dates must be null/);
+      return new Response(JSON.stringify({model:"test",stop_reason:"tool_use",content:[{type:"tool_use",name:"save_recommendation_draft",input:draft}]}),{status:200});
+    };
+    const result=await runCopilotChat([{role:"user",content:"Plug in a recommendation, do not execute"}],{},
+      (input,model)=>saveRecommendationDraft(input,crypto.randomUUID(),model));
+    assert.ok(result.draft);assert.match(result.reply,/draft saved/);
+    assert.equal((await sql.query("SELECT count(*) FROM recommendation_drafts")).rows[0].count,"1");
+    assert.equal((await storage.listFlies()).length,0);
+  } finally {
+    globalThis.fetch=originalFetch;
+    if(oldKey===undefined)delete process.env.COPILOT_API_KEY;else process.env.COPILOT_API_KEY=oldKey;
+  }
+});
 async function failJournal(){
   await sql.query(`CREATE OR REPLACE FUNCTION reject_paper_journal() RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN RAISE EXCEPTION 'injected journal failure'; END $$;

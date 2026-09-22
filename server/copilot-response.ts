@@ -1,5 +1,5 @@
 type ProviderReply = {
-  content?: Array<{ type?: string; text?: unknown }>;
+  content?: Array<{ type?: string; text?: unknown; name?: string; input?: unknown }>;
   stop_reason?: string;
   model?: string;
   usage?: { input_tokens?: number; output_tokens?: number };
@@ -22,13 +22,21 @@ export async function requestCopilotReply(
   request: (maxTokens: number) => Promise<unknown>,
   budget: number,
   fallbackModel: string,
-): Promise<{ reply: string; model: string }> {
+  saveDraft?: (input:unknown,model:string)=>Promise<unknown>,
+): Promise<{ reply: string; model: string; draft?:unknown }> {
   const data = await request(budget) as ProviderReply | null;
   const blocks = Array.isArray(data?.content) ? data.content : [];
   const reply = blocks
     .filter((block) => block?.type === "text" && typeof block.text === "string")
     .map((block) => block.text as string).join("\n").trim();
   const complete = data?.stop_reason === "end_turn";
+  const tools=blocks.filter(b=>b?.type==="tool_use");
+  if(data?.stop_reason==="tool_use" && saveDraft && tools.length===1 && tools[0].name==="save_recommendation_draft") {
+    const model=typeof data.model==="string"?data.model:fallbackModel;
+    const draft=await saveDraft(tools[0].input,model);
+    // Do not echo unverified claims about writes from accompanying model prose.
+    return {reply:"Recommendation draft saved in Strategy → Recommendation drafts. Review and edit the populated fields there. This did not create a position, approve a checklist, or arm automation. Missing evidence must still be verified.",model,draft};
+  }
   // Safe diagnostic metadata only: never prompt, answer, hidden thinking or credentials.
   console.info("Copilot response metadata", {
     model: data?.model ?? fallbackModel,
@@ -40,7 +48,7 @@ export async function requestCopilotReply(
     hasAnswer: Boolean(reply),
     complete,
   });
-  if (complete && reply && reply !== "(empty response)") {
+  if (complete && tools.length===0 && reply && reply !== "(empty response)") {
     return { reply, model: typeof data?.model === "string" ? data.model : fallbackModel };
   }
   throw Object.assign(

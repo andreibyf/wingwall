@@ -31,6 +31,7 @@ import { runAutoTrade, tradingWeek } from "./auto-trade";
 import { freshQuote, paperMode } from "./automation-policy";
 import { workerStatus } from "./paper-worker";
 import { registerStrategyRoutes } from "./strategy-store";
+import {registerDraftRoutes,saveRecommendationDraft,draftForRequest} from "./recommendation-drafts";
 import { resolveExitPolicy, assessThresholdReachability } from "@shared/exit-policy";
 import { getIbkrFlyQuote, isIbkrSupported, IbkrPricingError } from "./ibkr";
 import {
@@ -897,13 +898,17 @@ export async function registerRoutes(
         return res.status(400).json({ message: "No valid messages provided" });
       }
 
+      const requestId=z.string().uuid().parse(req.body.requestId??crypto.randomUUID());
+      const existing=await draftForRequest(requestId);
+      if(existing)return res.json({reply:"This request already saved a recommendation draft. Review it in Strategy → Recommendation drafts. No trade was executed.",model:copilotModel,draft:existing});
       const snapshot = await buildSignalSnapshot(getFlyLivePricing, getChain);
-      const result = await runCopilotChat(messages, snapshot);
+      const result = await runCopilotChat(messages, snapshot,(input,model)=>saveRecommendationDraft(input,requestId,model));
       res.json(result);
     } catch (err) {
       next(err);
     }
   });
 
+  registerDraftRoutes(app);
   return httpServer;
 }
