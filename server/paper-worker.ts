@@ -4,6 +4,7 @@ import { runAutoTrade, type AutoTradeDeps } from "./auto-trade";
 import { commitPaperExit } from "./paper-ledger";
 import { eastern, entryWindow, exitReason, freshQuote, marketOpen, paperMode } from "./automation-policy";
 import { operatorConfigured } from "./operator-auth";
+import {runSpreadLearning} from "./spread-learning";
 
 export type QuoteFn = (symbol:string,type:"call"|"put",expiry:string,lower:number,body:number,upper:number,contracts:number)=>Promise<any>;
 export async function workerStatus() {
@@ -59,6 +60,8 @@ export async function runPaperWorker(deps:AutoTradeDeps & {quote:QuoteFn}) {
             }
           } catch(err) {detail.alerts.push(`Fly ${fly.id}: ${(err as Error).message}`);}
         }
+        detail.spreads=await runSpreadLearning(deps.fetchChain,deps.now);
+        for(const d of detail.spreads.decisions??[])if(["blocked","exit_blocked","settlement_required"].includes(d.action))detail.alerts.push(`Spread plan ${d.planId}: ${d.reason}`);
         // Interval-based cooldown, not an exact-minute gate. Delayed wakes still work.
         const recent=await client.query(`SELECT 1 FROM paper_worker_runs WHERE finished_at IS NOT NULL
           AND detail->'entry' IS NOT NULL AND detail->'entry'<>'null'::jsonb

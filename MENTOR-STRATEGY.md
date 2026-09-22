@@ -23,9 +23,9 @@ These are conservative application policies, not extra rules attributed to the m
 - Existing position exits remain available even if reviews expire or turn NO-GO. Open-position structure/size edits cannot bypass entry controls; close and create a reviewed replacement. Historical closed-record entry remains available.
 - A review is a strategy-level operator attestation, not automated verification of live indicators or approval of every possible strike combination. Existing structure, price and timing guards still apply.
 
-## Layer planning, not execution
+## Layer planning and optional paper experiments
 
-The documents do not define how many layers, when to add them, spacing, sizing progression, averaging-down permissions or campaign-level exit policy. No automatic entry or layer-management rules have been invented.
+The documents do not define how many layers, when to add them, spacing, sizing progression, averaging-down permissions or campaign-level exit policy. At the operator's subsequent request, explicit numeric paper-experiment rules are supported separately from the mentor checklist. They are application policies, not rules attributed to the mentor. See `PAPER-LEARNING.md`.
 
 The planner supports bullish call debit spreads and bearish put debit spreads on QQQ/SPY (100 multiplier). Each layer has expiration, ordered long/short strikes, contracts, debit, target credit, stop credit and a written entry/add trigger. The operator declares a total full-debit risk cap and a layer-count limit (default one; UI validation ceiling ten, not a trading recommendation).
 
@@ -33,16 +33,16 @@ The server validates direction, strike order, real calendar dates, debit/target/
 
 Full debit is the maximum-loss risk basis: a planned stop is not guaranteed. Fees and slippage are not modeled. Summing per-layer maximum profits is not a guarantee those maxima can be realized together, especially with different expirations. Alternative saved plans do not reserve capital. Past-expiry hypothetical plans may be saved for study; nothing executes them.
 
-Plans remain clearly marked `plan_only`. They do not create ledger positions or affect Overview P&L, win rate, account deployment or the butterfly worker. A plan can be saved with a failed/missing review for study; this is never execution permission. Review status recorded at save is historical, not current approval.
+Saving a plan remains `plan_only`; it does not create a position. A separate, explicitly enabled rule set can authorize simulated worker entries, subject to all runtime gates. Actual spread fills and net profitability live in the separate paper spread ledger, not butterfly Overview metrics. A plan can be saved with a failed/missing review for study; this is never execution permission. Review status recorded at save is historical, not current approval.
 
-Copilot receives current review status and recent plans, with instructions not to claim that plans are positions or that workers execute/manage them.
+Copilot receives reviews, plans, actual spread positions, decisions and saved reflections. Its instructions distinguish planned scenarios from executed paper positions and explain worker prerequisites. Chat itself remains advice-only.
 
 ## Verification and release
 
-Run `npm run check`, `npm run test:strategy`, `npm run test:automation`, `npm run test:db`, `npm run test:copilot`, and `npm run build`. PostgreSQL suites use isolated disposable localhost databases, never production.
+Run `npm run check`, `npm run test:strategy`, `npm run test:learning`, `npm run test:automation`, `npm run test:db`, `npm run test:copilot`, and `npm run build`. PostgreSQL suites use isolated disposable localhost databases, never production.
 
 Browser verification covers both strategy forms, negative-gamma and flip-chop decisions, review persistence, spread economics, two-layer saving, reload persistence, and mobile layout. Production observation mode and the entry switch are not changed by this feature.
 
-Release verification: 105 automated tests passed (16 strategy policy, 47 automation including database integration, 20 existing database and 22 Copilot tests). TypeScript and production build passed. Database-backed browser checks verified negative-gamma rejection, directional confirmation, a saved two-layer plan surviving reload, and desktop/mobile layouts without document overflow. The attached hosted preview is an isolated fixture, not the production database.
+Release verification: 122 automated tests passed (16 strategy policy, 4 learning policy, 60 automation including database integration, 20 existing database and 22 Copilot tests). TypeScript and production build passed. Database-backed browser checks verified negative-gamma rejection, directional confirmation, a saved two-layer plan surviving reload, learning reflections and paper-rule configuration, and desktop/mobile layouts without document overflow. The attached hosted preview is an isolated fixture, not the production database.
 
-Before implementing spread execution, confirm the mentor's layer count, add trigger, size progression, total campaign risk, and per-layer versus basket exit rules. Also complete fresh-feed readiness. The uploaded checklists alone are insufficient authorization for unattended spread execution.
+Before enabling a paper experiment, declare numeric triggers and costs and review the application policies in `PAPER-LEARNING.md`. Fresh-feed readiness remains required. The mentor PDFs do not endorse these layering defaults. No real broker execution is implemented or authorized.

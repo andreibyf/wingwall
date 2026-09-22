@@ -109,6 +109,24 @@ CREATE INDEX IF NOT EXISTS strategy_reviews_latest ON strategy_reviews(symbol,st
 CREATE TABLE IF NOT EXISTS spread_plans (
   id SERIAL PRIMARY KEY, payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS spread_rules (
+  plan_id INTEGER PRIMARY KEY REFERENCES spread_plans(id), payload JSONB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS spread_positions (
+  id SERIAL PRIMARY KEY,plan_id INTEGER NOT NULL REFERENCES spread_plans(id),layer_index INTEGER NOT NULL,
+  symbol TEXT NOT NULL,contracts INTEGER NOT NULL,entry_debit DOUBLE PRECISION NOT NULL,entry_fees DOUBLE PRECISION NOT NULL,
+  opened_at TIMESTAMPTZ NOT NULL,entry_evidence JSONB NOT NULL,status TEXT NOT NULL DEFAULT 'open',
+  mark_credit DOUBLE PRECISION,mark_at TIMESTAMPTZ,exit_credit DOUBLE PRECISION,realized_pnl DOUBLE PRECISION,
+  closed_at TIMESTAMPTZ,exit_reason TEXT,UNIQUE(plan_id,layer_index)
+);
+CREATE TABLE IF NOT EXISTS spread_decisions (
+  id SERIAL PRIMARY KEY,plan_id INTEGER NOT NULL,action TEXT NOT NULL,detail JSONB NOT NULL,
+  decision_key TEXT UNIQUE,created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS trade_reflections (
+  id SERIAL PRIMARY KEY,position_id INTEGER NOT NULL REFERENCES spread_positions(id),text TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 `);
 
   // Additive migration: older databases predate the peak-tracking columns.
@@ -410,8 +428,10 @@ export class DatabaseStorage implements IStorage {
   async createFly(fly: InsertFly): Promise<Fly> {
     const {assertButterflyReview}=await import("./strategy-store");
     return db.transaction(async tx=>{
-      await tx.execute(sql`LOCK TABLE flies, strategy_reviews IN SHARE ROW EXCLUSIVE MODE`);
+      await tx.execute(sql`LOCK TABLE flies, strategy_reviews, spread_positions IN SHARE ROW EXCLUSIVE MODE`);
       if((fly.status??"open")!=="closed") {
+        if((await tx.execute(sql`SELECT 1 FROM spread_positions WHERE status='open' LIMIT 1`)).rows.length)
+          throw Object.assign(Error("Paper spreads are open; close them before starting a butterfly campaign"),{status:409});
         const review=await assertButterflyReview(fly.symbol,new Date(),tx);
         fly={...fly,notes:`${fly.notes??""}\nMentor checklist review ${review.id}; operator paper entry.`};
       }

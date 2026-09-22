@@ -2,6 +2,7 @@ import {useState} from "react";
 import {useQuery,useMutation} from "@tanstack/react-query";
 import {apiRequest,queryClient} from "@/lib/queryClient";
 import {Button} from "@/components/ui/button";
+import {PaperLearning} from "@/components/app/PaperLearning";
 import {CHECKLISTS,reviewSchema,evaluateReview,layerPlanSchema,calculateLayerPlan,REVIEW_MINUTES,type Strategy as StrategyType,type ReviewInput,type LayerPlan} from "@shared/strategy-policy";
 
 const field="w-full rounded-md border border-input bg-background p-2 text-sm";
@@ -75,7 +76,7 @@ export default function Strategy(){
     </section>
     <section className={panel}>
       <h3 className="font-semibold">Debit-spread layer planner</h3>
-      <p className="text-sm text-muted-foreground">Your mentor’s documents do not specify layering triggers, spacing, count or sizing. Declare your own proposed limits here for review. These are saved scenarios, not orders, positions or an automatic layering system.</p>
+      <p className="text-sm text-muted-foreground">Declare your proposed layers and limits. Saving creates a scenario, not a position. Optional paper automation is configured separately below with explicit numeric triggers; it does not interpret the written trigger as executable code.</p>
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <label className="grid gap-1 text-sm">Plan symbol<select className={field} value={plan.symbol} onChange={e=>setPlan({...plan,symbol:e.target.value as "QQQ"|"SPY"})}><option>QQQ</option><option>SPY</option></select></label>
         <label className="grid gap-1 text-sm">Plan direction<select className={field} value={plan.direction} onChange={e=>setPlan({...plan,direction:e.target.value as "bullish"|"bearish"})}><option value="bullish">Bullish call spreads</option><option value="bearish">Bearish put spreads</option></select></label>
@@ -105,9 +106,10 @@ export default function Strategy(){
         <div className="mt-3 space-y-2"><p>{p.payload.thesis}</p><p>{p.payload.riskWarning}</p>
           <p className="text-muted-foreground">Review at save: {p.payload.reviewStatus}, {p.payload.reviewCurrent?"current then":"missing/expired then"}. Reassess before any entry. Other saved plans are alternatives, not reserved capital.</p>
           {p.payload.layers.map((l:any,i:number)=><p key={i}>Layer {i+1}: {l.optionType} {l.longStrike}/{l.shortStrike}, {l.expiration}, {l.contracts} contract(s), debit {l.debit}. Trigger: {l.addTrigger}</p>)}
-          <p className="text-muted-foreground">Plan only. No spread position exists and no worker manages this plan.</p></div>
+          <p className="text-muted-foreground">This is the original planning scenario. Check the paper ledger below for any actual simulated entries and current automation settings.</p></div>
       </details>)}</div>
     </section>
+    <PaperLearning plans={data?.plans??[]}/>
     {message&&<div role="status" className="sticky bottom-0 rounded-lg border border-border bg-background p-3 text-sm shadow-md">{message}</div>}
   </div>;
 }

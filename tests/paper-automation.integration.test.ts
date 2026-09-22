@@ -46,7 +46,7 @@ beforeEach(async()=>{
       take_profit_mode='multipleOfDebit',take_profit_value=2,stop_loss_pct_of_max_loss=-0.4;
     INSERT INTO campaign_walls (symbol,week_of,wall_price,active_branch,created_at)
       VALUES('QQQ','2026-09-21',100,'rejects','2026-09-21');`);
-  await sql.query("TRUNCATE strategy_reviews,spread_plans RESTART IDENTITY");
+  await sql.query("TRUNCATE strategy_reviews,spread_plans,spread_decisions RESTART IDENTITY CASCADE");
   const review={symbol:"QQQ",strategy:"butterfly",gamma:"positive",direction:"bearish",flipChop:"no",strongConfirmation:"unknown",
     checks:Object.fromEntries(CHECKLISTS.butterfly.map(c=>[c.id,"go"])),evidence:"Test fixture only: all positive checklist evidence."};
   await sql.query("INSERT INTO strategy_reviews(symbol,strategy,payload,version,created_at) VALUES($1,$2,$3,$4,$5)",
@@ -247,4 +247,126 @@ test("current GO permits manual paper entry but open exposure edits cannot bypas
   await assert.rejects(storage.updateFly(fly.id,{contracts:2}),/immutable/);
   const note=await storage.updateFly(fly.id,{notes:"updated observation"});
   assert.equal(note.notes,"updated observation");
+});
+
+async function spreadFixture(layers=1){
+  await sql.query("UPDATE settings SET account_balance=5000");
+  const layer={optionType:"call",expiration:"2026-09-24",longStrike:100,shortStrike:105,contracts:1,debit:1.8,targetCredit:4.5,stopCredit:.2,addTrigger:"Hold above the confirmed directional level"};
+  const plan={symbol:"QQQ",direction:"bullish",riskCap:500,maxLayers:layers,thesis:"Directional continuation; invalidate on reversal",layers:Array.from({length:layers},()=>({...layer}))};
+  const id=(await sql.query("INSERT INTO spread_plans(payload) VALUES($1) RETURNING id",[plan])).rows[0].id;
+  const rules={enabled:true,triggers:plan.layers.map(()=>({comparison:"above",spot:100})),feePerContractLeg:.65,slippagePerSpread:.02};
+  await sql.query("INSERT INTO spread_rules(plan_id,payload) VALUES($1,$2)",[id,rules]);
+  const review={symbol:"QQQ",strategy:"debit_spread",gamma:"positive",direction:"bullish",flipChop:"no",strongConfirmation:"yes",
+    checks:Object.fromEntries(CHECKLISTS.debit_spread.map(c=>[c.id,"go"])),evidence:"Fixture directional evidence only"};
+  await sql.query("INSERT INTO strategy_reviews(symbol,strategy,payload,version,created_at) VALUES('QQQ','debit_spread',$1,$2,$3)",[review,CHECKLIST_VERSION,now]);
+  return {id,rules,plan};
+}
+const spreadChain=(at=now,longBid=2)=>({symbol:"QQQ",spot:101,timestamp:at.toISOString(),options:[
+  {strike:100,expiration:"2026-09-24",type:"call",bid:longBid,ask:longBid+.1},
+  {strike:105,expiration:"2026-09-24",type:"call",bid:1,ask:1.1}]});
+async function spreadRun(chain:any=spreadChain(),at=now){
+  const {runSpreadLearning}=await import("../server/spread-learning");
+  return runSpreadLearning(async()=>chain,at);
+}
+test("spread worker commits once under concurrent evaluations with evidence and costs",async()=>{
+  await spreadFixture();await Promise.all([spreadRun(),spreadRun()]);
+  const p=(await sql.query("SELECT * FROM spread_positions")).rows;
+  assert.equal(p.length,1);assert.ok(Math.abs(p[0].entry_debit-1.12)<1e-8);assert.equal(p[0].entry_fees,1.3);
+  assert.equal(p[0].entry_evidence.review.strategy,"debit_spread");
+});
+test("observe mode records a decision but cannot create a paper fill",async()=>{
+  await spreadFixture();process.env.PAPER_AUTOMATION_MODE="observe";await spreadRun();
+  assert.equal((await sql.query("SELECT * FROM spread_positions")).rowCount,0);
+  assert.equal((await sql.query("SELECT * FROM spread_decisions WHERE action='would_enter'")).rowCount,1);
+});
+test("stale quotes, wrong symbols and missing leg quotes block spread execution",async()=>{
+  await spreadFixture();
+  for(const chain of [{...spreadChain(),timestamp:"2026-09-21T13:00:00Z"},{...spreadChain(),symbol:"SPY"},{...spreadChain(),options:[]}]){
+    await spreadRun(chain);assert.equal((await sql.query("SELECT * FROM spread_positions")).rowCount,0);
+  }
+});
+test("no entry with disabled master, failed review or exceeded account budget",async()=>{
+  await spreadFixture();
+  await sql.query("UPDATE settings SET auto_trade_enabled=false");await spreadRun();
+  assert.equal((await sql.query("SELECT * FROM spread_positions")).rowCount,0);
+  await sql.query("UPDATE settings SET auto_trade_enabled=true,account_balance=100");await spreadRun();
+  assert.equal((await sql.query("SELECT * FROM spread_positions")).rowCount,0);
+  await sql.query("UPDATE settings SET account_balance=5000;DELETE FROM strategy_reviews WHERE strategy='debit_spread'");await spreadRun();
+  assert.equal((await sql.query("SELECT * FROM spread_positions")).rowCount,0);
+});
+test("spread take-profit exits despite disarmed entries and missing reviews; P&L net of both fees",async()=>{
+  const {id}=await spreadFixture();await spreadRun();
+  await sql.query("UPDATE settings SET auto_trade_enabled=false;DELETE FROM strategy_reviews");
+  await sql.query("UPDATE spread_rules SET payload=jsonb_set(payload,'{enabled}','false') WHERE plan_id=$1",[id]);
+  const later=new Date("2026-09-21T14:01:00Z");await spreadRun(spreadChain(later,5.7),later);
+  const p=(await sql.query("SELECT * FROM spread_positions")).rows[0];
+  assert.equal(p.status,"closed");assert.equal(p.exit_reason,"take-profit");assert.ok(Math.abs(p.realized_pnl-343.4)<1e-6);
+  await spreadRun(spreadChain(later,5.7),later);
+  assert.equal((await sql.query("SELECT * FROM spread_decisions WHERE action='exit'")).rowCount,1);
+});
+test("spread stops are automatic and stale exit quotes cannot invent a close",async()=>{
+  await spreadFixture();await spreadRun();
+  const later=new Date("2026-09-21T14:05:00Z");
+  await spreadRun(spreadChain(now,1.2),later);
+  assert.equal((await sql.query("SELECT status FROM spread_positions")).rows[0].status,"open");
+  await spreadRun(spreadChain(later,1.2),later);
+  assert.equal((await sql.query("SELECT exit_reason FROM spread_positions")).rows[0].exit_reason,"stop-loss");
+});
+test("layers wait ten minutes, reject averaging down, then allow a profitable add",async()=>{
+  await spreadFixture(2);await spreadRun();
+  const early=new Date("2026-09-21T14:05:00Z");await spreadRun(spreadChain(early,2.5),early);
+  assert.equal((await sql.query("SELECT * FROM spread_positions")).rowCount,1);
+  const later=new Date("2026-09-21T14:11:00Z");await spreadRun(spreadChain(later),later);
+  assert.equal((await sql.query("SELECT * FROM spread_positions")).rowCount,1);
+  await spreadRun(spreadChain(later,2.5),later);
+  assert.equal((await sql.query("SELECT * FROM spread_positions")).rowCount,2);
+});
+test("spread expiry curfew closes while an already expired contract requires settlement",async()=>{
+  await spreadFixture();await spreadRun();
+  const curfew=new Date("2026-09-24T19:46:00Z");await spreadRun(spreadChain(curfew),curfew);
+  assert.equal((await sql.query("SELECT exit_reason FROM spread_positions")).rows[0].exit_reason,"expiry-curfew");
+  await sql.query("UPDATE spread_positions SET status='open',exit_reason=NULL");
+  const expired=new Date("2026-09-25T14:00:00Z");await spreadRun(spreadChain(expired),expired);
+  assert.equal((await sql.query("SELECT status FROM spread_positions")).rows[0].status,"open");
+  assert.equal((await sql.query("SELECT * FROM spread_decisions WHERE action='settlement_required'")).rowCount,1);
+});
+test("spread entries require fresh evidence and no layers add after a close",async()=>{
+  await spreadFixture(2);
+  await sql.query("UPDATE strategy_reviews SET created_at=created_at-interval '1 hour' WHERE strategy='debit_spread'");
+  await spreadRun();assert.equal((await sql.query("SELECT * FROM spread_positions")).rowCount,0);
+  await sql.query("UPDATE strategy_reviews SET created_at=$1",[now]);
+  await spreadRun();
+  const later=new Date("2026-09-21T14:11:00Z");await spreadRun(spreadChain(later,1.2),later);
+  await spreadRun(spreadChain(later,2.5),later);
+  assert.equal((await sql.query("SELECT * FROM spread_positions")).rowCount,1);
+  assert.equal((await sql.query("SELECT status FROM spread_positions")).rows[0].status,"closed");
+});
+test("manual and automatic butterfly entry cannot overlap open spread campaign",async()=>{
+  await spreadFixture();await spreadRun();
+  await sql.query("UPDATE strategy_reviews SET created_at=now()");
+  await assert.rejects(storage.createFly(position),/spreads are open/);
+  await assert.rejects(commitEntry(await input()),/spreads are already open/);
+});
+test("learning endpoints authenticate and retain reflections for later chat context",async()=>{
+  assert.equal((await fetch(base+"/api/learning")).status,401);
+  await spreadFixture();await spreadRun();const cookie=await login();
+  const p=(await sql.query("SELECT id FROM spread_positions")).rows[0];
+  const r=await fetch(base+"/api/learning/reflections",{method:"POST",headers:{cookie,"content-type":"application/json"},body:JSON.stringify({positionId:p.id,text:"I followed the trigger; next time compare the evidence before the price move."})});
+  assert.equal(r.status,201);
+  const snapshot=await (await fetch(base+"/api/learning",{headers:{cookie}})).json();
+  assert.equal(snapshot.reflections.length,1);assert.equal(snapshot.summary.open,1);
+  assert.equal(snapshot.positions[0].entry_evidence.policy,"paper-spread-v1");
+});
+test("post-entry policy edits are rejected but entry disarming is allowed",async()=>{
+  const {id,rules}=await spreadFixture();await spreadRun();const cookie=await login();
+  const post=(body:any)=>fetch(`${base}/api/strategy/plans/${id}/automation`,{method:"POST",headers:{cookie,"content-type":"application/json"},body:JSON.stringify(body)});
+  assert.equal((await post({...rules,enabled:false,feePerContractLeg:0})).status,409);
+  assert.equal((await post({...rules,enabled:false})).status,200);
+});
+test("multiple layer exits in one minute each retain their own decision evidence",async()=>{
+  await spreadFixture(2);await spreadRun();
+  const later=new Date("2026-09-21T14:11:00Z");await spreadRun(spreadChain(later,2.5),later);
+  const exitAt=new Date("2026-09-21T14:12:00Z");await spreadRun(spreadChain(exitAt,5.7),exitAt);
+  assert.equal((await sql.query("SELECT * FROM spread_positions WHERE status='closed'")).rowCount,2);
+  assert.equal((await sql.query("SELECT * FROM spread_decisions WHERE action='exit'")).rowCount,2);
 });

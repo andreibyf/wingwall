@@ -12,7 +12,7 @@ export async function commitPaperEntry(input:{
 }) {
   return db.transaction(async tx=>{
     // Locks also serialize with manual INSERT/PATCH/DELETE endpoints, not just workers.
-    await tx.execute(sql`LOCK TABLE settings, campaign_walls, flies, strategy_reviews IN SHARE ROW EXCLUSIVE MODE`);
+    await tx.execute(sql`LOCK TABLE settings, campaign_walls, flies, strategy_reviews, spread_positions IN SHARE ROW EXCLUSIVE MODE`);
     const now=(input.now??(()=>new Date()))(), window=entryWindow(now);
     if(paperMode()!=="paper" || !operatorConfigured() || !window.allowed || !freshQuote(input.quoteTimestamp,now)) throw fail("Paper entry no longer authorized, in-window, or fresh");
     const [current]=await tx.select().from(settings).where(eq(settings.id,1));
@@ -25,6 +25,7 @@ export async function commitPaperEntry(input:{
     if(!wall || wall.symbol!==input.fly.symbol || wall.weekOf!==window.monday || JSON.stringify(wall)!==JSON.stringify(input.wallSnapshot)) throw fail("Campaign changed during review");
     const existing=await tx.select().from(flies);
     if(existing.some(f=>f.status==="open")) throw fail("A position is already open");
+    if((await tx.execute(sql`SELECT 1 FROM spread_positions WHERE status='open' LIMIT 1`)).rows.length)throw fail("Paper spreads are already open; no new butterfly campaign");
     if(existing.some(f=>f.symbol===input.fly.symbol && f.entryDate>=window.monday && f.entryDate<=window.expiration)) throw fail("An entry already exists this campaign week");
     const claimed=await tx.execute(sql`SELECT 1 FROM paper_entry_claims WHERE symbol=${input.fly.symbol} AND week_of=${window.monday}`);
     if(claimed.rows.length) throw fail("Campaign entry already claimed");

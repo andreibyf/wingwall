@@ -2,6 +2,7 @@ import {sql} from "drizzle-orm";
 import {db,storage} from "./storage";
 import {CHECKLIST_VERSION,currentReview,evaluateReview,reviewSchema,layerPlanSchema,calculateLayerPlan,type Strategy} from "../shared/strategy-policy";
 import type {Express} from "express";
+import {registerLearningRoutes,learningSnapshot} from "./spread-learning";
 const fail=(message:string)=>Object.assign(new Error(message),{status:409});
 export async function latestStrategyReview(symbol:string,strategy:Strategy,connection:any=db) {
   const result=await connection.execute(sql`SELECT id,payload,created_at AS "createdAt",version
@@ -20,9 +21,10 @@ export async function strategySnapshot() {
     FROM strategy_reviews ORDER BY symbol,strategy,id DESC`);
   const plans=await db.execute(sql`SELECT id,payload,created_at AS "createdAt" FROM spread_plans ORDER BY id DESC LIMIT 20`);
   return {reviews:reviews.rows.map((r:any)=>({...r,...r.payload,current:currentReview(r),assessment:evaluateReview(r.payload)})),
-    plans:plans.rows,spreadExecution:"Not implemented: plans are not open positions. No automatic spread entries, layering or exits."};
+    plans:plans.rows,learning:await learningSnapshot(),spreadExecution:"Saved plans are not positions. Explicit numeric paper rules plus master switch, paper mode, current review and fresh quotes are required. Exits run independently of entry arming."};
 }
 export function registerStrategyRoutes(app:Express) {
+  registerLearningRoutes(app);
   app.get("/api/strategy",async(_req,res,next)=>{try{res.json(await strategySnapshot());}catch(e){next(e);}});
   app.post("/api/strategy/reviews",async(req,res,next)=>{
     try {
