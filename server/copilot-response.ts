@@ -35,7 +35,7 @@ export async function requestCopilotReply(
     const model=typeof data.model==="string"?data.model:fallbackModel;
     const draft=await saveDraft(tools[0].input,model);
     // Do not echo unverified claims about writes from accompanying model prose.
-    return {reply:"Recommendation draft saved in Strategy → Recommendation drafts. Review and edit the populated fields there. This did not create a position, approve a checklist, or arm automation. Missing evidence must still be verified.",model,draft};
+    return {reply:"Draft saved in Strategy → Recommendation drafts for review and editing. No position created, checklist approved, or automation armed. Verify missing evidence before use.",model,draft};
   }
   // Safe diagnostic metadata only: never prompt, answer, hidden thinking or credentials.
   console.info("Copilot response metadata", {
