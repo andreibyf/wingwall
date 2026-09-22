@@ -4,6 +4,7 @@ import {apiRequest,queryClient} from "@/lib/queryClient";
 import {Button} from "@/components/ui/button";
 import {PaperLearning} from "@/components/app/PaperLearning";
 import {RecommendationDrafts} from "@/components/app/RecommendationDrafts";
+import {ChecklistSuggestions} from "@/components/app/ChecklistSuggestions";
 import {CHECKLISTS,reviewSchema,evaluateReview,layerPlanSchema,calculateLayerPlan,REVIEW_MINUTES,type Strategy as StrategyType,type ReviewInput,type LayerPlan} from "@shared/strategy-policy";
 
 const field="w-full rounded-md border border-input bg-background p-2 text-sm";
@@ -49,6 +50,7 @@ export default function Strategy(){
         {select("Chopping around flip?","flipChop",["unknown","yes","no"])}
         {review.strategy==="debit_spread"&&select("Stronger directional confirmation?","strongConfirmation",["unknown","yes","no"])}
       </div>
+      <ChecklistSuggestions key={`${review.symbol}:${review.strategy}`} symbol={review.symbol} strategy={review.strategy} drafts={data?.recommendationDrafts??[]}/>
       <p className="text-xs text-muted-foreground">Paraphrased from your mentor’s supplied checklists. Select GO only with current evidence. In Wingwall’s conservative implementation every row must pass; there is no score-based override.</p>
       <div className="divide-y divide-border">
         {CHECKLISTS[review.strategy].map((c,i)=><div key={c.id} className="grid gap-2 py-4 md:grid-cols-[1fr_140px]">

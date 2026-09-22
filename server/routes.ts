@@ -32,6 +32,7 @@ import { freshQuote } from "./automation-policy";
 import {paperMode,setAutomationMode} from "./automation-control";
 import { workerStatus } from "./paper-worker";
 import { registerStrategyRoutes } from "./strategy-store";
+import {registerChecklistEvidence} from "./checklist-evidence";
 import {registerDraftRoutes,saveRecommendationDraft,draftForRequest} from "./recommendation-drafts";
 import { resolveExitPolicy, assessThresholdReachability } from "@shared/exit-policy";
 import { getIbkrFlyQuote, isIbkrSupported, IbkrPricingError } from "./ibkr";
@@ -211,6 +212,7 @@ export async function registerRoutes(
   app: Express
 ): Promise<Server> {
   registerStrategyRoutes(app);
+  registerChecklistEvidence(app,getChain);
   app.get("/api/automation/status",async(_req,res,next)=>{
     try {res.json(await workerStatus());} catch(err){next(err);}
   });

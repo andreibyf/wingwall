@@ -67,6 +67,31 @@ async function login(){
   const r=await fetch(`${base}/api/auth/login`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({password:"integration-only-passphrase"})});
   assert.equal(r.status,200);return r.headers.get("set-cookie")!.split(";")[0];
 }
+test("checklist evidence is authenticated, read-only and tolerates feed failure",async()=>{
+  const {registerChecklistEvidence}=await import("../server/checklist-evidence");
+  const {installOperatorAuth}=await import("../server/operator-auth");
+  const app=express();app.use(express.json());installOperatorAuth(app);
+  let calls=0;
+  registerChecklistEvidence(app,async()=>{calls++;throw Error("fixture outage");});
+  const srv=createServer(app);srv.listen(0,"127.0.0.1");await once(srv,"listening");
+  const endpoint=`http://127.0.0.1:${(srv.address() as any).port}/api/strategy/evidence?symbol=QQQ&strategy=butterfly`;
+  try{
+    assert.equal((await fetch(endpoint)).status,401);assert.equal(calls,0);
+    const cookie=await login();
+    const before=await sql.query("SELECT payload FROM strategy_reviews ORDER BY id");
+    const settings=await storage.getSettings();
+    const response=await fetch(endpoint,{headers:{cookie}});
+    assert.equal(response.status,200);assert.equal(response.headers.get("cache-control"),"no-store");
+    const body=await response.json();
+    assert.equal(body.items.find((i:any)=>i.id==="expected_move").status,"missing");
+    assert.match(body.items.find((i:any)=>i.id==="expected_move").detail,/request failed/);
+    assert.equal((await fetch(endpoint+"&draftId=99999",{headers:{cookie}})).status,409);
+    assert.equal(calls,1);
+    assert.deepEqual((await sql.query("SELECT payload FROM strategy_reviews ORDER BY id")).rows,before.rows);
+    assert.deepEqual(await storage.getSettings(),settings);
+    assert.equal((await sql.query("SELECT count(*) FROM flies")).rows[0].count,"0");
+  }finally{await new Promise<void>(resolve=>srv.close(()=>resolve()));}
+});
 test("recommendation drafts persist idempotently, edit with version checks and never touch trading state",async()=>{
   const {saveRecommendationDraft}=await import("../server/recommendation-drafts");
   const draft={title:"Conditional draft",symbol:"QQQ",strategy:"wait",direction:"unknown",thesis:"Need evidence",
@@ -110,7 +135,7 @@ test("chat sends only the draft tool and persists a validated model proposal",as
     };
     const result=await runCopilotChat([{role:"user",content:"Plug in a recommendation, do not execute"}],{},
       (input,model)=>saveRecommendationDraft(input,crypto.randomUUID(),model));
-    assert.ok(result.draft);assert.match(result.reply,/draft saved/);
+    assert.ok(result.draft);assert.match(result.reply,/draft saved/i);
     assert.equal((await sql.query("SELECT count(*) FROM recommendation_drafts")).rows[0].count,"1");
     assert.equal((await storage.listFlies()).length,0);
   } finally {
