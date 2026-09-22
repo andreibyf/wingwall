@@ -4,7 +4,8 @@ import {db} from "./storage";
 import {latestStrategyReview} from "./strategy-store";
 import {currentReview} from "../shared/strategy-policy";
 import {spreadRuleSchema,spreadQuote,learningSummary} from "../shared/paper-learning";
-import {eastern,session,entryWindow,marketOpen,freshQuote,paperMode} from "./automation-policy";
+import {eastern,session,entryWindow,marketOpen,freshQuote} from "./automation-policy";
+import {paperMode} from "./automation-control";
 import {operatorConfigured} from "./operator-auth";
 import {z} from "zod";
 const fail=(message:string)=>Object.assign(Error(message),{status:409});
@@ -15,7 +16,7 @@ export async function learningSnapshot(){
     rules:(await db.execute(sql`SELECT * FROM spread_rules ORDER BY plan_id`)).rows,
     decisions:(await db.execute(sql`SELECT * FROM spread_decisions ORDER BY id DESC LIMIT 100`)).rows,
     reflections:(await db.execute(sql`SELECT * FROM trade_reflections ORDER BY id DESC LIMIT 50`)).rows,
-    mode:paperMode(),policy:"paper-spread-v1",
+    mode:await paperMode(),policy:"paper-spread-v1",
     instructions:["State thesis and evidence, then say what would invalidate it.",
       "Compare butterfly, directional spread and waiting; explain why alternatives fail.",
       "Before entry: confirm current review, both bid/ask legs, total debit risk and costs.",
@@ -51,7 +52,7 @@ export function registerLearningRoutes(app:Express){
         ON CONFLICT(plan_id) DO UPDATE SET payload=excluded.payload`);
       await tx.execute(sql`INSERT INTO spread_decisions(plan_id,action,detail) VALUES(${id},'configuration',${JSON.stringify({rules,policy:"paper-spread-v1"})}::jsonb)`);
     });
-    res.json({saved:true,mode:paperMode(),message:"Paper rules saved. Observe mode does not execute; master entry switch and fresh evidence still required. Disabling entries never disables exits."});
+    res.json({saved:true,mode:await paperMode(),message:"Paper rules saved. Observe mode does not execute; master entry switch and fresh evidence still required. Disabling entries never disables exits."});
   }catch(e){next(e);}});
 }
 // Called by the existing once-per-minute, advisory-locked scheduler. No broker API.
@@ -82,7 +83,7 @@ export async function runSpreadLearning(fetchChain:(s:string)=>Promise<any>,fixe
       if(chain.symbol!==plan.symbol||!marketOpen(now())||!freshQuote(chain?.timestamp,now())){await record("blocked",{reason:"Market closed or quote missing/stale/wrong symbol; no simulated fills",providerError:chain.error});return;}
       const positions=(await tx.execute(sql`SELECT * FROM spread_positions WHERE plan_id=${row.id} ORDER BY layer_index`)).rows as any[];
       const settings=(await tx.execute(sql`SELECT * FROM settings WHERE id=1`)).rows[0] as any;
-      const executable=paperMode()==="paper"&&operatorConfigured();
+      const executable=await paperMode(tx)==="paper"&&operatorConfigured();
       for(const position of positions.filter(p=>p.status==="open")){
         const l=plan.layers[position.layer_index],et=eastern(now());
         if(l.expiration<et.date){await record("settlement_required",{positionId:position.id,reason:"Expired; no invented settlement"});continue;}

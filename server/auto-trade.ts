@@ -16,7 +16,8 @@ import { buildProposal, branchPolicy, type FlyProposal, type BranchPolicy } from
 import { analyzeChain, MONDAY_TO_THURSDAY_TRADING_DAYS, type ChainFn, type ChainData } from "./chain-analysis";
 import { resolveExitPolicy, type ExitPolicy } from "../shared/exit-policy";
 import { callModelOnce } from "./copilot";
-import { entryWindow, eastern, freshQuote, remainingSessions, paperMode } from "./automation-policy";
+import { entryWindow, eastern, freshQuote, remainingSessions } from "./automation-policy";
+import {paperMode} from "./automation-control";
 import { commitPaperEntry } from "./paper-ledger";
 import { assertButterflyReview } from "./strategy-store";
 
@@ -187,7 +188,7 @@ export async function runAutoTrade(
   }
   const window = entryWindow(now);
   if (!window.allowed) return { ...base, outcome:"no_proposal", detail:window.reason };
-  if (!dryRun && paperMode() !== "paper") return { ...base, outcome:"disabled", detail:"Paper workers are in observation mode." };
+  if (!dryRun && await paperMode() !== "paper") return { ...base, outcome:"disabled", detail:"Paper workers are in observation mode." };
 
   // One position at a time. Stacking a second fly on an open one doubles deployed capital
   // without any of the sizing arithmetic knowing it happened.

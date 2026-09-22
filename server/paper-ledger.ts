@@ -1,7 +1,8 @@
 import { sql, eq } from "drizzle-orm";
 import { db } from "./storage";
 import { flies, journalNotes, settings, campaignWalls, type InsertFly } from "../shared/schema";
-import { entryWindow, freshQuote, paperMode, eastern, exitReason } from "./automation-policy";
+import { entryWindow, freshQuote, eastern, exitReason } from "./automation-policy";
+import {paperMode} from "./automation-control";
 import { operatorConfigured } from "./operator-auth";
 import { assertButterflyReview } from "./strategy-store";
 
@@ -14,7 +15,7 @@ export async function commitPaperEntry(input:{
     // Locks also serialize with manual INSERT/PATCH/DELETE endpoints, not just workers.
     await tx.execute(sql`LOCK TABLE settings, campaign_walls, flies, strategy_reviews, spread_positions IN SHARE ROW EXCLUSIVE MODE`);
     const now=(input.now??(()=>new Date()))(), window=entryWindow(now);
-    if(process.env.PAPER_ENTRY_ENABLED==="false" || paperMode()!=="paper" || !operatorConfigured() || !window.allowed || !freshQuote(input.quoteTimestamp,now)) throw fail("Paper entry no longer authorized, in-window, or fresh");
+    if(process.env.PAPER_ENTRY_ENABLED==="false" || await paperMode(tx)!=="paper" || !operatorConfigured() || !window.allowed || !freshQuote(input.quoteTimestamp,now)) throw fail("Paper entry no longer authorized, in-window, or fresh");
     const [current]=await tx.select().from(settings).where(eq(settings.id,1));
     if(!current?.autoTradeEnabled || JSON.stringify(current)!==JSON.stringify(input.settingsSnapshot)) throw fail("Settings changed or entry disarmed during review");
     if(!Number.isFinite(input.fly.maxLoss) || input.fly.maxLoss<=0 ||
@@ -41,7 +42,7 @@ export async function commitPaperExit(input:{flyId:number; mid:number; timestamp
   return db.transaction(async tx=>{
     await tx.execute(sql`LOCK TABLE settings, flies IN SHARE ROW EXCLUSIVE MODE`);
     const now=(input.now??(()=>new Date()))();
-    if(paperMode()!=="paper" || !operatorConfigured() || process.env.PAPER_EXIT_ENABLED==="false" || !freshQuote(input.timestamp,now)) throw fail("Paper exit not authorized or quote stale");
+    if(await paperMode(tx)!=="paper" || !operatorConfigured() || process.env.PAPER_EXIT_ENABLED==="false" || !freshQuote(input.timestamp,now)) throw fail("Paper exit not authorized or quote stale");
     const [fly]=await tx.select().from(flies).where(eq(flies.id,input.flyId));
     if(!fly || fly.status!=="open") return {outcome:"already_closed",flyId:input.flyId};
     if(!["QQQ","SPY"].includes(fly.symbol)) throw fail("Unsupported automatic settlement symbol");

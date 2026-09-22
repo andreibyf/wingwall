@@ -38,6 +38,8 @@ before(async()=>{
   base=`http://127.0.0.1:${(server.address() as any).port}`;
 });
 beforeEach(async()=>{
+  delete process.env.PAPER_AUTOMATION_FORCE_OBSERVE;
+  await sql.query("UPDATE automation_control SET mode=NULL,version=1; TRUNCATE automation_mode_events");
   await sql.query("TRUNCATE recommendation_drafts RESTART IDENTITY");
   delete process.env.PAPER_ENTRY_ENABLED;
   process.env.PAPER_AUTOMATION_MODE="paper";delete process.env.PAPER_EXIT_ENABLED;
@@ -115,6 +117,54 @@ test("chat sends only the draft tool and persists a validated model proposal",as
     globalThis.fetch=originalFetch;
     if(oldKey===undefined)delete process.env.COPILOT_API_KEY;else process.env.COPILOT_API_KEY=oldKey;
   }
+});
+test("mode selector is authenticated, acknowledged, versioned and never arms entries",async()=>{
+  const cookie=await login();
+  const path=base+"/api/automation/mode";
+  const put=(body:any,auth=true)=>fetch(path,{method:"PUT",headers:{"content-type":"application/json",...(auth?{cookie}:{})},body:JSON.stringify(body)});
+  const body={mode:"observe",version:1,acknowledge:true};
+  assert.equal((await put(body,false)).status,401);
+  assert.notEqual((await put({...body,acknowledge:false})).status,200);
+  assert.equal((await put({...body,mode:"live"})).status===200,false);
+  assert.equal((await put(body)).status,200);
+  assert.equal((await storage.getSettings()).autoTradeEnabled,false);
+  assert.equal((await workerStatus()).mode,"observe");
+  assert.equal((await put(body)).status,409);
+  assert.equal((await sql.query("SELECT * FROM automation_mode_events")).rowCount,1);
+  assert.equal((await put({mode:"paper",version:2,acknowledge:true})).status,409); // no heartbeat
+  await sql.query("INSERT INTO paper_worker_runs(run_key,mode,outcome,started_at,finished_at) VALUES('mode-test','observe','ok',now(),now())");
+  process.env.PAPER_ENTRY_ENABLED="false";
+  assert.equal((await put({mode:"paper",version:2,acknowledge:true})).status,200);
+  const status=await workerStatus();
+  assert.equal(status.mode,"paper");assert.equal(status.entryLocked,true);assert.equal(status.entryArmed,false);
+  await assert.rejects(storage.updateSettings({autoTradeEnabled:true}),/locked/);
+});
+test("persisted mode survives schema startup, blocks in-flight fills and honors emergency Observe override",async()=>{
+  const {setAutomationMode,paperMode}=await import("../server/automation-control");
+  const i=await input();
+  await setAutomationMode("observe",1);
+  await (await import("../server/storage")).ensureSchema();
+  assert.equal(await paperMode(),"observe");
+  await assert.rejects(commitEntry(i),/authorized/);
+  await assert.rejects(storage.updateSettings({autoTradeEnabled:true}),/Observe/);
+  await setAutomationMode("paper",2);
+  assert.equal(await paperMode(),"paper");
+  assert.equal((await storage.getSettings()).autoTradeEnabled,false);
+  process.env.PAPER_AUTOMATION_FORCE_OBSERVE="true";
+  assert.equal(await paperMode(),"observe");
+  await assert.rejects(setAutomationMode("paper",3),/locked/);
+  assert.equal((await storage.getSettings()).autoTradeEnabled,false);
+});
+test("Observe stops exits without closing positions; Paper resumes exits while entries remain disarmed",async()=>{
+  const {setAutomationMode}=await import("../server/automation-control");
+  const r=await commitEntry(await input());
+  await setAutomationMode("observe",1);
+  await assert.rejects(commitExit({flyId:r.flyId,mid:2,timestamp:now.toISOString(),source:"fixture",now:()=>now}),/authorized/);
+  assert.equal((await storage.getFly(r.flyId)).status,"open");
+  await setAutomationMode("paper",2);
+  assert.equal((await storage.getSettings()).autoTradeEnabled,false);
+  await commitExit({flyId:r.flyId,mid:2,timestamp:now.toISOString(),source:"fixture",now:()=>now});
+  assert.equal((await storage.getFly(r.flyId)).status,"closed");
 });
 async function failJournal(){
   await sql.query(`CREATE OR REPLACE FUNCTION reject_paper_journal() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -331,6 +381,25 @@ test("observe mode records a decision but cannot create a paper fill",async()=>{
   await spreadFixture();process.env.PAPER_AUTOMATION_MODE="observe";await spreadRun();
   assert.equal((await sql.query("SELECT * FROM spread_positions")).rowCount,0);
   assert.equal((await sql.query("SELECT * FROM spread_decisions WHERE action='would_enter'")).rowCount,1);
+});
+test("spread ledger rechecks persisted mode after fetching quotes and resumes exits without arming entries",async()=>{
+  const {setAutomationMode}=await import("../server/automation-control");
+  const {runSpreadLearning}=await import("../server/spread-learning");
+  await spreadFixture();
+  await runSpreadLearning(async()=>{await setAutomationMode("observe",1);return spreadChain();},now);
+  assert.equal((await sql.query("SELECT * FROM spread_positions")).rowCount,0);
+  await setAutomationMode("paper",2);
+  await storage.updateSettings({autoTradeEnabled:true});
+  await spreadRun();
+  assert.equal((await sql.query("SELECT * FROM spread_positions WHERE status='open'")).rowCount,1);
+  await setAutomationMode("observe",3);
+  const later=new Date("2026-09-21T14:01:00Z");
+  await spreadRun(spreadChain(later,5.7),later);
+  assert.equal((await sql.query("SELECT * FROM spread_positions WHERE status='open'")).rowCount,1);
+  await setAutomationMode("paper",4);
+  await spreadRun(spreadChain(later,5.7),later);
+  assert.equal((await sql.query("SELECT * FROM spread_positions WHERE status='closed'")).rowCount,1);
+  assert.equal((await storage.getSettings()).autoTradeEnabled,false);
 });
 test("stale quotes, wrong symbols and missing leg quotes block spread execution",async()=>{
   await spreadFixture();

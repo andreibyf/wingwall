@@ -9,7 +9,8 @@ Default mode is `observe`: the worker records eligible proposals and exit decisi
 ## Required deployment configuration
 
 - `WINGWALL_OPERATOR_PASSWORD`: a new private passphrase, at least 16 characters, set through Render Environment. Never commit it or send it in chat. Missing/short configuration locks private APIs, not anonymous access.
-- `PAPER_AUTOMATION_MODE=observe`: retain through initial verification. Only explicit `paper` enables paper ledger writes.
+- `PAPER_AUTOMATION_MODE=observe`: initial default until an authenticated operator explicitly selects a mode in Settings. A persisted UI selection takes precedence over this default; do not use this variable as an emergency override.
+- `PAPER_AUTOMATION_FORCE_OBSERVE=true`: deployment-level emergency override, always wins over the UI and blocks paper mode selection.
 - `PAPER_EXIT_ENABLED=true`: independent of the entry switch. In observe mode this does not authorize closure. `false` blocks automatic closure even in paper mode.
 - Existing database/model variables remain unchanged. `CRON_SECRET` remains restricted to the legacy peak endpoint; it cannot access settings or entry execution.
 
@@ -47,7 +48,17 @@ Model failure or incomplete output never grants approval. The risk gate uses exp
 
 A worker process exit releases the database lease. Abandoned run records are marked on a later wake. Repeated wakes in the same minute do not rerun; the next eligible wake may retry decisions, but weekly claims and closed-state checks prevent duplicate committed actions.
 
-Observe mode is also the emergency rollback setting. To stop new entries, disarm in Settings. To stop all automatic ledger mutations, set `PAPER_AUTOMATION_MODE=observe` and redeploy; leave exit monitoring visible. Reverting code alone does not remove the additive run/claim tables.
+To stop new entries while retaining paper exits, turn Auto entry off in Settings. To stop automatic simulated entries AND exits, select Observe in Settings and confirm the warning. For a deployment-level emergency override, set `PAPER_AUTOMATION_FORCE_OBSERVE=true` and redeploy. Observe leaves existing positions open; it is not a liquidation command or exit protection. Reverting code alone does not remove the additive run/claim tables.
+
+## UI mode selector
+
+Settings → Paper-worker readiness now includes Observe / Paper automation, effective mode, configuration source, deployment entry-lock status and global entry blockers. Quote freshness and checklist readiness are deliberately not certified by the heartbeat.
+
+Mode changes require authenticated same-origin requests, explicit effect acknowledgment and a current version. Paper selection requires a healthy worker and configured operator authentication. Either selection atomically disarms new entries and records an audit event; it does not change positions, draft recommendations, spread rules or deployment locks. Paper mode can resume exits for existing positions if exits are enabled and all execution checks pass. Existing per-plan entry rules remain configured but inactive while master entry is disarmed.
+
+The database singleton persists across restarts. Mode writes serialize with execution through the settings lock; both butterfly and spread ledgers read effective mode inside their transactions. Database read errors fail closed. `PAPER_ENTRY_ENABLED=false` still blocks arming and entries and cannot be overridden from the UI.
+
+Selector verification: typecheck and build pass; 134 regression tests pass (67 automation, 27 Copilot/draft, 20 duplicate-wall DB, 16 strategy, 4 learning). Tests cover authenticated and acknowledged changes, optimistic conflict rejection, startup persistence, emergency override, in-flight proposal rejection, and exit pause/resume for both workers with entries disarmed. Desktop and 375px mobile browser checks cover confirmation, cancel, save/reload, both mode directions, visible lock status and disabled entry arming. Preview mode changes are isolated fixtures, not production changes.
 
 ## QA inventory
 

@@ -11,6 +11,7 @@ import { useToast } from "@/hooks/use-toast";
 import { AlertTriangle, Loader2, ShieldCheck, Play } from "lucide-react";
 import { resolveExitPolicy } from "@shared/exit-policy";
 import { useQuery } from "@tanstack/react-query";
+import {AutomationMode} from "@/components/app/AutomationMode";
 
 /**
  * Everything the automation reads at runtime, editable. Nothing on this page is cosmetic:
@@ -171,6 +172,7 @@ export default function Settings() {
       </p>
       <section className="rounded-lg border border-border p-4 space-y-2" data-testid="automation-readiness">
         <h2 className="text-sm font-semibold">Paper-worker readiness</h2>
+        <AutomationMode status={automation}/>
         <p className="text-sm">Mode: {automation?.mode ?? "checking"} · Heartbeat: {automation?.heartbeatFresh?"current":"missing or stale"}</p>
         <p className="text-sm">Entries: {automation?.entryArmed?"armed":"off"} · Exit worker: {automation?.exitsEnabled?"enabled":"disabled"}</p>
         <p className="text-xs text-muted-foreground">Observation mode evaluates proposals even with entry off, but never opens or closes positions. Paper-write mode requires quotes no more than two minutes old. Entry window: Monday–Wednesday, 9:45–10:30 AM Eastern, excluding holidays.</p>
@@ -354,6 +356,7 @@ export default function Settings() {
           </div>
           <Switch
             checked={armed}
+            disabled={!armed&&(!automation||automation.entryLocked||automation.mode!=="paper"||!automation.healthy||!automation.operatorConfigured)}
             onCheckedChange={toggleAutoTrade}
             data-testid="switch-auto-trade"
             aria-label="Arm autonomous entry"

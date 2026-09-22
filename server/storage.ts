@@ -36,6 +36,15 @@ CREATE TABLE IF NOT EXISTS users (
   username TEXT NOT NULL UNIQUE,
   password TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS automation_control (
+  id INTEGER PRIMARY KEY CHECK(id=1),mode TEXT CHECK(mode IN ('observe','paper')),
+  version INTEGER NOT NULL DEFAULT 1, updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO automation_control(id) VALUES(1) ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS automation_mode_events (
+  id SERIAL PRIMARY KEY,previous_mode TEXT NOT NULL,new_mode TEXT NOT NULL,
+  detail TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS recommendation_drafts (
   id SERIAL PRIMARY KEY, request_id TEXT NOT NULL UNIQUE,
   payload JSONB NOT NULL, original_payload JSONB NOT NULL, model TEXT NOT NULL,
@@ -559,8 +568,15 @@ export class DatabaseStorage implements IStorage {
     if(s.autoTradeEnabled===true && process.env.PAPER_ENTRY_ENABLED==="false")
       throw Object.assign(Error("Entries are locked off by deployment configuration"),{status:409});
     await this.getSettings();
-    const rows = await db.update(settings).set(s).where(eq(settings.id, 1)).returning();
-    return rows[0];
+    return db.transaction(async tx=>{
+      await tx.execute(sql`LOCK TABLE settings IN SHARE ROW EXCLUSIVE MODE`);
+      if(s.autoTradeEnabled===true) {
+        const {paperMode}=await import("./automation-control");
+        if(await paperMode(tx)!=="paper")throw Object.assign(Error("Observe mode cannot arm entries"),{status:409});
+      }
+      const rows=await tx.update(settings).set(s).where(eq(settings.id,1)).returning();
+      return rows[0];
+    });
   }
 
   async getChecklist(weekOf: string): Promise<ExecutionChecklist | undefined> {
