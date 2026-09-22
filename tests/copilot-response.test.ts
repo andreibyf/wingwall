@@ -16,6 +16,14 @@ test("honors valid larger budget and avoids unsupported adaptive fields on legac
   assert.equal(getCopilotChatPolicy("claude-sonnet-5", "16384").max_tokens, 16384);
   assert.deepEqual(getCopilotChatPolicy("claude-haiku-4-5"), { max_tokens: 8192 });
 });
+test("interactive chat reserves draft headroom with medium effort despite old configured limits", () => {
+  for (const budget of [undefined, "1400", "8192", "16384"]) {
+    assert.deepEqual(getCopilotChatPolicy("claude-sonnet-5", budget, "medium"), {
+      max_tokens: 16384, thinking: {type:"adaptive"}, output_config: {effort:"medium"},
+    });
+  }
+  assert.equal(getCopilotChatPolicy("claude-sonnet-5","32768","medium").max_tokens,32768);
+});
 test("returns only complete text blocks without exposing thinking", async () => {
   const result = await requestCopilotReply(async () => ({
     content: [{ type: "thinking", text: "private" }, { type: "text", text: "First" }, { type: "text", text: "Second" }],
@@ -73,9 +81,9 @@ test("chat and gatekeeper use complete-response policy with sufficient thinking 
     ], { marker: "fresh-snapshot" });
     assert.equal(result.reply, "Complete answer.");
     assert.equal(requests.length, 1);
-    assert.equal(requests[0].max_tokens, 8192);
+    assert.equal(requests[0].max_tokens, 16384);
     assert.deepEqual(requests[0].thinking, { type: "adaptive" });
-    assert.deepEqual(requests[0].output_config, { effort: "high" });
+    assert.deepEqual(requests[0].output_config, { effort: "medium" });
     assert.ok(requests[0].messages.every((m: any) => m.content !== "(empty response)"));
     assert.match(requests[0].messages.at(-1).content, /fresh-snapshot/);
     await callModelOnce("Gatekeeper", "Test only");

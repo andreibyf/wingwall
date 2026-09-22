@@ -5,15 +5,16 @@ type ProviderReply = {
   usage?: { input_tokens?: number; output_tokens?: number };
 };
 
-export function getCopilotChatPolicy(model: string, configuredBudget?: string) {
+export function getCopilotChatPolicy(model: string, configuredBudget?: string, effort: "high" | "medium" = "high") {
   const value = Number(configuredBudget);
+  const minimum = effort === "medium" ? 16384 : 8192;
   // The old 1400-token ceiling can be exhausted entirely by hidden thinking.
   // Honor larger valid limits, but never retain that unsafe legacy chat ceiling.
-  const max_tokens = Number.isInteger(value) && value >= 8192 && value <= 128000 ? value : 8192;
+  const max_tokens = Number.isInteger(value) && value >= minimum && value <= 128000 ? value : minimum;
   // Sonnet 5 is production's model. Do not send unsupported adaptive settings
   // to the older Haiku fallback or unknown Messages-compatible providers.
   return /^claude-sonnet-5(?:-|$)/.test(model)
-    ? { max_tokens, thinking: { type: "adaptive" as const }, output_config: { effort: "high" as const } }
+    ? { max_tokens, thinking: { type: "adaptive" as const }, output_config: { effort } }
     : { max_tokens };
 }
 
