@@ -14,7 +14,7 @@ export async function commitPaperEntry(input:{
     // Locks also serialize with manual INSERT/PATCH/DELETE endpoints, not just workers.
     await tx.execute(sql`LOCK TABLE settings, campaign_walls, flies, strategy_reviews, spread_positions IN SHARE ROW EXCLUSIVE MODE`);
     const now=(input.now??(()=>new Date()))(), window=entryWindow(now);
-    if(paperMode()!=="paper" || !operatorConfigured() || !window.allowed || !freshQuote(input.quoteTimestamp,now)) throw fail("Paper entry no longer authorized, in-window, or fresh");
+    if(process.env.PAPER_ENTRY_ENABLED==="false" || paperMode()!=="paper" || !operatorConfigured() || !window.allowed || !freshQuote(input.quoteTimestamp,now)) throw fail("Paper entry no longer authorized, in-window, or fresh");
     const [current]=await tx.select().from(settings).where(eq(settings.id,1));
     if(!current?.autoTradeEnabled || JSON.stringify(current)!==JSON.stringify(input.settingsSnapshot)) throw fail("Settings changed or entry disarmed during review");
     if(!Number.isFinite(input.fly.maxLoss) || input.fly.maxLoss<=0 ||

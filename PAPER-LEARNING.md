@@ -29,6 +29,8 @@ These are Wingwall policies, not inferred mentor instructions:
 
 ## Ledger and operations
 
+`PAPER_ENTRY_ENABLED=false` is an explicit deployment lock. Startup persists the master entry switch as off, settings cannot rearm it, and both automatic entry paths reject writes. Removing the lock later does not itself rearm the stored switch. The health endpoint reports `entryArmed` and `entryLocked` without exposing account data.
+
 Unique `(plan_id, layer_index)` keys and transaction locks prevent duplicate fills. The existing once-per-minute advisory-locked scheduler invokes the spread worker, including when the browser is closed. The provider chain is fetched once per symbol per worker run. Repeated decision writes within a minute are deduplicated.
 
 The learning panel reports spread realized net P&L, closed/open count, win rate and profit factor, including fees on both sides. Marks retain their timestamps and are not presented as current when unavailable. Butterfly metrics remain in Overview; neither screen claims to be a combined account total. Paper results do not guarantee achievable fills or an edge.
@@ -37,7 +39,7 @@ Observe mode records would-enter/would-exit without creating fills. The hosted p
 
 ## Verification
 
-122 tests passed: 60 automation policy/database tests, 20 existing database tests, 22 Copilot tests, 16 strategy tests and 4 learning-policy tests. TypeScript and production build passed.
+123 tests passed: 61 automation policy/database tests, 20 existing database tests, 22 Copilot tests, 16 strategy tests and 4 learning-policy tests. TypeScript and production build passed.
 
 Tests cover concurrent entry idempotence, conservative pricing, costs/net P&L, stale and wrong-symbol quotes, absent legs, missing/expired reviews, disabled entry switches, risk ceilings, no averaging down, layer spacing, no adds after exits, independent target/stop/expiry exits, expired settlement flags, authentication, saved reflections and immutable post-entry policy.
 

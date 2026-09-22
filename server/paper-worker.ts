@@ -15,6 +15,7 @@ export async function workerStatus() {
   const healthy=heartbeatFresh && Boolean(lastCompleted && Date.now()-new Date(lastCompleted.finished_at as string).getTime()<180_000) && lastCompleted?.outcome==="ok";
   const settings=await storage.getSettings();
   return {paperOnly:true,mode:paperMode(),entryArmed:settings?.autoTradeEnabled===true,
+    entryLocked:process.env.PAPER_ENTRY_ENABLED==="false",
     exitsEnabled:process.env.PAPER_EXIT_ENABLED!=="false",heartbeatFresh,healthy,
     operatorConfigured:operatorConfigured(),quoteMaxAgeSeconds:120,
     nextEntryWindow:"Monday–Wednesday, 09:45–10:30 America/New_York; exchange holidays excluded",

@@ -101,6 +101,7 @@ export async function runSpreadLearning(fetchChain:(s:string)=>Promise<any>,fixe
       }
       if(!rules.enabled||positions.length>=plan.layers.length)return;
       const block=async(reason:string)=>record("wait",{reason});
+      if(process.env.PAPER_ENTRY_ENABLED==="false")return block("Entries locked off by deployment configuration");
       if(!entryWindow(now()).allowed)return block(entryWindow(now()).reason);
       if(!settings?.auto_trade_enabled)return block("Master auto-entry switch is off");
       if(positions.some(p=>p.status==="closed"))return block("A layer has exited; no further adds in this campaign");

@@ -242,6 +242,9 @@ ALTER TABLE gex_levels_cache ALTER COLUMN gamma_flip TYPE DOUBLE PRECISION;
 ALTER TABLE gex_levels_cache ALTER COLUMN spot TYPE DOUBLE PRECISION;
 ALTER TABLE gex_levels_cache ALTER COLUMN net_gex_oi TYPE DOUBLE PRECISION;
 `);
+  // Explicit deployment lock: fail startup if the requested disarm cannot persist.
+  if(process.env.PAPER_ENTRY_ENABLED==="false")
+    await pool.query("UPDATE settings SET auto_trade_enabled=false WHERE id=1");
 }
 
 /**
@@ -547,6 +550,8 @@ export class DatabaseStorage implements IStorage {
   }
 
   async updateSettings(s: Partial<InsertSettings>): Promise<Settings> {
+    if(s.autoTradeEnabled===true && process.env.PAPER_ENTRY_ENABLED==="false")
+      throw Object.assign(Error("Entries are locked off by deployment configuration"),{status:409});
     await this.getSettings();
     const rows = await db.update(settings).set(s).where(eq(settings.id, 1)).returning();
     return rows[0];

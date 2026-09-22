@@ -38,6 +38,7 @@ before(async()=>{
   base=`http://127.0.0.1:${(server.address() as any).port}`;
 });
 beforeEach(async()=>{
+  delete process.env.PAPER_ENTRY_ENABLED;
   process.env.PAPER_AUTOMATION_MODE="paper";delete process.env.PAPER_EXIT_ENABLED;
   process.env.WINGWALL_OPERATOR_PASSWORD="integration-only-passphrase";
   await sql.query(`DROP TRIGGER IF EXISTS reject_journal ON journal_notes;
@@ -369,4 +370,16 @@ test("multiple layer exits in one minute each retain their own decision evidence
   const exitAt=new Date("2026-09-21T14:12:00Z");await spreadRun(spreadChain(exitAt,5.7),exitAt);
   assert.equal((await sql.query("SELECT * FROM spread_positions WHERE status='closed'")).rowCount,2);
   assert.equal((await sql.query("SELECT * FROM spread_decisions WHERE action='exit'")).rowCount,2);
+});
+test("deployment entry lock persists disarm, prevents rearming and blocks both entry ledgers",async()=>{
+  const entry=await input();await spreadFixture();
+  process.env.PAPER_ENTRY_ENABLED="false";
+  try{
+    await assert.rejects(commitEntry(entry),/not.*authorized|no longer authorized/);
+    await spreadRun();assert.equal((await sql.query("SELECT * FROM spread_positions")).rowCount,0);
+    const {ensureSchema}=await import("../server/storage");await ensureSchema();
+    assert.equal((await storage.getSettings()).autoTradeEnabled,false);
+    await assert.rejects(storage.updateSettings({autoTradeEnabled:true}),/locked off/);
+    assert.equal((await workerStatus()).entryLocked,true);
+  }finally{delete process.env.PAPER_ENTRY_ENABLED;}
 });

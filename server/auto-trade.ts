@@ -179,6 +179,8 @@ export async function runAutoTrade(
 
   const enabled = settings?.autoTradeEnabled === true;
   base.autoTradeEnabled = enabled;
+  if(!dryRun && process.env.PAPER_ENTRY_ENABLED==="false")
+    return {...base,outcome:"disabled",detail:"Entries locked off by deployment configuration."};
 
   if (!enabled && !opts.ignoreToggle) {
     return { ...base, outcome: "disabled", detail: "Autonomous entry is switched off in Settings." };
