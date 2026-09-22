@@ -4,6 +4,7 @@ import {Pool} from "pg";
 import express from "express";
 import {createServer,type Server} from "node:http";
 import {once} from "node:events";
+import {CHECKLISTS,CHECKLIST_VERSION} from "../shared/strategy-policy";
 
 const url=new URL(process.env.TEST_DATABASE_URL??"postgresql://localhost:55432/postgres");
 assert.equal(url.hostname,"localhost");assert.equal(url.pathname,"/postgres");assert.equal(url.search,"");
@@ -45,6 +46,11 @@ beforeEach(async()=>{
       take_profit_mode='multipleOfDebit',take_profit_value=2,stop_loss_pct_of_max_loss=-0.4;
     INSERT INTO campaign_walls (symbol,week_of,wall_price,active_branch,created_at)
       VALUES('QQQ','2026-09-21',100,'rejects','2026-09-21');`);
+  await sql.query("TRUNCATE strategy_reviews,spread_plans RESTART IDENTITY");
+  const review={symbol:"QQQ",strategy:"butterfly",gamma:"positive",direction:"bearish",flipChop:"no",strongConfirmation:"unknown",
+    checks:Object.fromEntries(CHECKLISTS.butterfly.map(c=>[c.id,"go"])),evidence:"Test fixture only: all positive checklist evidence."};
+  await sql.query("INSERT INTO strategy_reviews(symbol,strategy,payload,version,created_at) VALUES($1,$2,$3,$4,$5)",
+    ["QQQ","butterfly",JSON.stringify(review),CHECKLIST_VERSION,now]);
 });
 after(async()=>{
   if(server?.listening)await new Promise<void>(resolve=>server.close(()=>resolve()));
@@ -180,4 +186,65 @@ test("login attempts are rate limited across requests",async()=>{
 test("arming is rejected in observation mode even with authenticated operator",async()=>{
   process.env.PAPER_AUTOMATION_MODE="observe";const cookie=await login();
   assert.equal((await fetch(base+"/api/settings",{method:"PUT",headers:{cookie,"content-type":"application/json"},body:'{"autoTradeEnabled":true}'})).status,409);
+});
+test("missing, negative-gamma and expired reviews block automatic entries without ledger writes",async()=>{
+  const i=await input();
+  await sql.query("DELETE FROM strategy_reviews");await assert.rejects(commitEntry(i),/mentor checklist/);
+  await sql.query("INSERT INTO strategy_reviews(symbol,strategy,payload,version,created_at) VALUES('QQQ','butterfly',$1,$2,$3)",
+    [JSON.stringify({symbol:"QQQ",strategy:"butterfly",gamma:"negative",direction:"bearish",flipChop:"no",strongConfirmation:"yes",checks:Object.fromEntries(CHECKLISTS.butterfly.map(c=>[c.id,"go"])),evidence:"Negative gamma fixture"}),CHECKLIST_VERSION,now]);
+  await assert.rejects(commitEntry(i),/mentor checklist/);
+  await sql.query(`UPDATE strategy_reviews SET payload=jsonb_set(payload,'{gamma}','"positive"'),created_at=$1`,[new Date(now.getTime()-31*60_000)]);
+  await assert.rejects(commitEntry(i),/mentor checklist/);
+  assert.equal((await storage.listFlies()).length,0);
+});
+test("new NO-GO supersedes earlier GO, and review route rejects unrecognized status",async()=>{
+  const cookie=await login();
+  const payload={symbol:"QQQ",strategy:"butterfly",gamma:"negative",direction:"bearish",flipChop:"no",strongConfirmation:"yes",
+    checks:Object.fromEntries(CHECKLISTS.butterfly.map(c=>[c.id,"go"])),evidence:"Current observation: negative gamma"};
+  const r=await fetch(`${base}/api/strategy/reviews`,{method:"POST",headers:{"content-type":"application/json",cookie},body:JSON.stringify(payload)});
+  assert.equal(r.status,201);assert.equal((await r.json()).assessment.status,"no_go");
+  await assert.rejects(commitEntry(await input()),/mentor checklist/);
+  const invalid=await fetch(`${base}/api/strategy/reviews`,{method:"POST",headers:{"content-type":"application/json",cookie},body:JSON.stringify({...payload,gamma:"assumed"})});
+  assert.notEqual(invalid.status,201);
+});
+test("manual open cannot bypass checklist; historical closed record and exit remain possible",async()=>{
+  await sql.query("DELETE FROM strategy_reviews");
+  await assert.rejects(storage.createFly(position),/mentor checklist/);
+  const old=await storage.createFly({...position,status:"closed",exitDebit:1,exitDate:"2026-09-21"});
+  assert.equal(old.status,"closed");
+});
+test("layer plans persist with no positions, claims or journals and reject excess risk",async()=>{
+  const cookie=await login();
+  const plan={symbol:"QQQ",direction:"bullish",riskCap:100,maxLayers:2,thesis:"Hold above VWAP; invalidate on sustained reversal",
+    layers:[{optionType:"call",expiration:"2026-09-24",longStrike:100,shortStrike:105,contracts:1,debit:0.5,targetCredit:1.5,stopCredit:0.1,addTrigger:"Only after confirmed retest holds"}]};
+  const request=(p:any)=>fetch(`${base}/api/strategy/plans`,{method:"POST",headers:{"content-type":"application/json",cookie},body:JSON.stringify(p)});
+  const r=await request(plan);assert.equal(r.status,201);
+  const body=await r.json();assert.equal(body.payload.status,"plan_only");assert.equal(body.payload.calculation.totalMaxLoss,50);
+  assert.equal((await storage.listFlies()).length,0);assert.equal((await storage.listJournalNotes()).length,0);
+  assert.equal((await sql.query("SELECT * FROM paper_entry_claims")).rowCount,0);
+  assert.equal((await request({...plan,riskCap:25})).status,409);
+  assert.equal((await sql.query("SELECT * FROM spread_plans")).rowCount,1);
+});
+test("strategy endpoints require operator login",async()=>{
+  for(const path of ["/api/strategy","/api/strategy/reviews","/api/strategy/plans"]) {
+    const r=await fetch(base+path,{method:path==="/api/strategy"?"GET":"POST",headers:{"content-type":"application/json"},...(path==="/api/strategy"?{}:{body:"{}"})});
+    assert.equal(r.status,401);
+  }
+});
+test("no-go review stops proposal before external feeds or model; existing exits are not gated",async()=>{
+  const {flyId}=await commitEntry(await input());
+  await sql.query("DELETE FROM strategy_reviews");
+  const result=await commitExit({flyId,mid:2,timestamp:now.toISOString(),source:"fixture",now:()=>now});
+  assert.equal(result.outcome,"closed");
+  const deps={now,fetchChain:async()=>{throw Error("must not fetch");},buildSnapshot:async()=>{throw Error("must not snapshot");},askModel:async()=>{throw Error("must not call model");}};
+  const response=await runAuto(deps,{dryRun:true,ignoreToggle:true});
+  assert.equal(response.outcome,"no_proposal");assert.match(response.detail,/mentor checklist/);
+});
+test("current GO permits manual paper entry but open exposure edits cannot bypass it",async()=>{
+  await sql.query("UPDATE strategy_reviews SET created_at=now()");
+  const fly=await storage.createFly(position);
+  assert.match(fly.notes,/Mentor checklist review/);
+  await assert.rejects(storage.updateFly(fly.id,{contracts:2}),/immutable/);
+  const note=await storage.updateFly(fly.id,{notes:"updated observation"});
+  assert.equal(note.notes,"updated observation");
 });

@@ -101,6 +101,14 @@ CREATE TABLE IF NOT EXISTS journal_notes (
   text TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS strategy_reviews (
+  id SERIAL PRIMARY KEY, symbol TEXT NOT NULL, strategy TEXT NOT NULL,
+  payload JSONB NOT NULL, version TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS strategy_reviews_latest ON strategy_reviews(symbol,strategy,id DESC);
+CREATE TABLE IF NOT EXISTS spread_plans (
+  id SERIAL PRIMARY KEY, payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 `);
 
   // Additive migration: older databases predate the peak-tracking columns.
@@ -400,11 +408,16 @@ export class DatabaseStorage implements IStorage {
   }
 
   async createFly(fly: InsertFly): Promise<Fly> {
-    const rows = await db
-      .insert(flies)
-      .values({ ...fly, createdAt: new Date().toISOString() })
-      .returning();
-    return rows[0];
+    const {assertButterflyReview}=await import("./strategy-store");
+    return db.transaction(async tx=>{
+      await tx.execute(sql`LOCK TABLE flies, strategy_reviews IN SHARE ROW EXCLUSIVE MODE`);
+      if((fly.status??"open")!=="closed") {
+        const review=await assertButterflyReview(fly.symbol,new Date(),tx);
+        fly={...fly,notes:`${fly.notes??""}\nMentor checklist review ${review.id}; operator paper entry.`};
+      }
+      const [row]=await tx.insert(flies).values({...fly,createdAt:new Date().toISOString()}).returning();
+      return row;
+    });
   }
 
   async updateFly(id: number, fly: Partial<InsertFly>): Promise<Fly | undefined> {
@@ -413,6 +426,9 @@ export class DatabaseStorage implements IStorage {
       const [current]=await tx.select().from(flies).where(eq(flies.id,id));
       if(!current) return undefined;
       if(current.status==="closed" && fly.status==="open") throw Object.assign(new Error("Closed positions cannot be reopened"),{status:409});
+      const exposureFields=["symbol","optionType","structureType","expiration","lowerStrike","middleStrike","upperStrike","contracts","entryDebit","maxLoss","maxProfit"] as const;
+      if(current.status==="open" && exposureFields.some(k=>fly[k]!==undefined && fly[k]!==current[k]))
+        throw Object.assign(new Error("Open-position exposure is immutable. Close and create a reviewed replacement; checklist gates cannot be bypassed by editing."),{status:409});
       if(fly.status==="closed" && current.status==="closed") return current;
       if(fly.status==="closed" && (!Number.isFinite(fly.exitDebit) || Number(fly.exitDebit)<0 || !fly.exitDate)) throw Object.assign(new Error("Closing requires a nonnegative exit debit and exit date"),{status:400});
       const [updated]=await tx.update(flies).set(fly).where(eq(flies.id,id)).returning();

@@ -1,12 +1,13 @@
 import { Link, useLocation } from "wouter";
 import type { ReactNode } from "react";
 import { WingwallLogo } from "./Logo";
-import { LayoutGrid, LineChart, Flag, BookText, Gauge, SlidersHorizontal } from "lucide-react";
+import { LayoutGrid, LineChart, Flag, BookText, Gauge, SlidersHorizontal, ListChecks } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const NAV = [
   { href: "/", label: "Overview", icon: LayoutGrid },
   { href: "/cockpit", label: "Cockpit", icon: Gauge },
+  { href: "/strategy", label: "Strategy", icon: ListChecks },
   { href: "/builder", label: "Builder", icon: LineChart },
   { href: "/campaign", label: "Campaign", icon: Flag },
   { href: "/journal", label: "Journal", icon: BookText },
@@ -61,9 +62,10 @@ export function Shell({ children }: { children: ReactNode }) {
         </h1>
       </header>
       <main className="col-start-1 overflow-y-auto pb-20 [overscroll-behavior:contain] px-4 py-6 md:col-start-2 md:px-6 md:pb-6">
+        {location==="/builder" && <div className="mb-4 rounded-md border border-border p-3 text-sm">New butterfly entries require a current GO mentor checklist. <Link href="/strategy" className="text-primary underline">Review strategy first</Link>. A butterfly no-go does not automatically approve a debit spread.</div>}
         {children}
       </main>
-      <nav className="fixed inset-x-0 bottom-0 z-10 flex items-stretch justify-around border-t border-sidebar-border bg-sidebar md:hidden">
+      <nav className="fixed inset-x-0 bottom-0 z-10 flex items-stretch overflow-x-auto border-t border-sidebar-border bg-sidebar md:hidden">
         {NAV.map((item) => {
           const active = location === item.href;
           const Icon = item.icon;
@@ -73,7 +75,7 @@ export function Shell({ children }: { children: ReactNode }) {
               href={item.href}
               data-testid={`link-nav-mobile-${item.label.toLowerCase()}`}
               className={cn(
-                "flex flex-1 flex-col items-center gap-1 py-2.5 text-[11px] font-medium",
+                "flex min-w-16 flex-1 flex-col items-center gap-1 px-2 py-2.5 text-xs font-medium",
                 active ? "text-sidebar-accent-foreground" : "text-sidebar-foreground/60"
               )}
             >

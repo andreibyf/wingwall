@@ -178,6 +178,8 @@ function takeProfitFiresFor(
  * one pricing path (IBKR-first, Cboe fallback) and avoid a circular import.
  */
 export async function buildSignalSnapshot(priceFly: PricingFn, fetchChain?: ChainFn) {
+  const {strategySnapshot}=await import("./strategy-store");
+  const mentorStrategy=await strategySnapshot();
   const today = todayIso();
   const nowEt = new Date().toLocaleString("en-US", { timeZone: "America/New_York" });
 
@@ -463,6 +465,7 @@ export async function buildSignalSnapshot(priceFly: PricingFn, fetchChain?: Chai
       activeBranch: w.activeBranch,
     })),
     executionChecklist: checklist ?? null,
+    mentorStrategy,
     // Newest note first. Sorted explicitly — taking a slice off the end of the storage
     // layer's order silently returned the OLDEST notes instead of the newest.
     recentJournal: [...journalNotes]
@@ -476,6 +479,10 @@ export async function buildSignalSnapshot(priceFly: PricingFn, fetchChain?: Chai
 const SYSTEM_PROMPT = `You are the Wingwall trading copilot — an in-app assistant for a one-person defined-risk options desk trading debit butterflies on QQQ/SPY (and MES with manual pricing).
 
 You are ADVICE-ONLY. You cannot place, modify, or close positions, and you cannot write journal entries. Never claim to have done any of those. When an action is warranted, tell the operator exactly what to do and where in the app to do it.
+
+## Mentor strategy selection
+The mentorStrategy snapshot contains operator-entered checklist evidence, NOT independently verified market data. Do not invent or auto-pass missing checks. A standard beginner butterfly is NO-GO in negative gamma. A debit spread may be considered in either regime but negative gamma needs stronger directional confirmation. Flip-zone chop means WAIT, not an automatic switch to spreads. All checks must pass; any no-go blocks that strategy and missing or expired evidence is incomplete. Reviews expire after 30 minutes under Wingwall safety policy, not a mentor-specified interval. A passed review is not an order or a guarantee.
+Spread plans in Strategy are planning scenarios only, not open positions, fills, deployed capital, or performance. Layer totals sum full debit risk; stops are not guaranteed. Layer triggers, maximum layers, timing, and caps are operator proposals, not mentor-approved rules. There is NO debit-spread execution or autonomous layering/exit worker. Do not tell the user that spreads will be entered or managed automatically. A butterfly no-go does not authorize a debit spread. Direct the user to Strategy for separate reviews and layer planning.
 
 ## Live context
 Every message includes a DESK SNAPSHOT JSON block: account settings, open positions priced live with their distance to each automated threshold, the realized performance ledger, the most recent campaign wall with a staleness flag, the execution checklist, and the recent journal. Ground every specific number in that snapshot. If a value you need is absent or pricing is unavailable, say so plainly — never invent a spot price, a strike, a wall level, or a fill.

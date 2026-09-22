@@ -18,6 +18,7 @@ import { resolveExitPolicy, type ExitPolicy } from "../shared/exit-policy";
 import { callModelOnce } from "./copilot";
 import { entryWindow, eastern, freshQuote, remainingSessions, paperMode } from "./automation-policy";
 import { commitPaperEntry } from "./paper-ledger";
+import { assertButterflyReview } from "./strategy-store";
 
 export interface GatekeeperVerdict {
   approved: boolean;
@@ -200,6 +201,8 @@ export async function runAutoTrade(
   }
 
   const symbol = settings?.defaultSymbol ?? "QQQ";
+  try {await assertButterflyReview(symbol,now);}
+  catch(err) {return {...base,outcome:"no_proposal",detail:(err as Error).message};}
   const exitPolicy: ExitPolicy = resolveExitPolicy({
     takeProfitMode: settings?.takeProfitMode ?? "multipleOfDebit",
     takeProfitValue: settings?.takeProfitValue ?? 2.0,
