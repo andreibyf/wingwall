@@ -33,7 +33,9 @@ const ANTHROPIC_VERSION = "2023-06-01";
 
 // Overridable so the model can be repointed from the Render dashboard without a redeploy.
 const DEFAULT_MODEL = process.env.COPILOT_MODEL || "claude-haiku-4-5";
-export const copilotChatPolicy = getCopilotChatPolicy(DEFAULT_MODEL, process.env.COPILOT_MAX_TOKENS);
+// Interactive chat needs room for a complete structured draft, without the gatekeeper's
+// high-effort reasoning latency. Execution risk-gate policy remains unchanged.
+export const copilotChatPolicy = getCopilotChatPolicy(DEFAULT_MODEL, process.env.COPILOT_MAX_TOKENS, "medium");
 
 // Thresholds used to live here as a pair of constants that silently duplicated
 // shared/thresholds.ts without importing it, so changing one left the copilot quoting a
@@ -619,6 +621,7 @@ export async function runCopilotChat(
   return requestCopilotReply(async (maxTokens) => {
   const res = await fetch(`${ANTHROPIC_BASE}/messages`, {
     method: "POST",
+    signal: AbortSignal.timeout(120_000),
     headers: {
       "content-type": "application/json",
       "x-api-key": apiKey,
