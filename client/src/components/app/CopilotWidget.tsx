@@ -11,7 +11,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { MessageSquare, X, Send, Loader2, RotateCcw } from "lucide-react";
-import { apiRequest } from "@/lib/queryClient";
+import { apiRequest,queryClient } from "@/lib/queryClient";
+import {useLocation} from "wouter";
 import { cn } from "@/lib/utils";
 
 type Msg = { role: "user" | "assistant"; content: string };
@@ -41,6 +42,7 @@ function readableError(err: unknown): string {
 }
 
 const SUGGESTIONS = [
+  "Plug in a recommendation draft for me. Do not execute.",
   "What's my position risk right now?",
   "Read my current campaign branch.",
   "How is my expectancy tracking?",
@@ -122,6 +124,9 @@ function MessageBody({ content }: { content: string }) {
 }
 
 export function CopilotWidget() {
+  const [,navigate]=useLocation();
+  const requestId=useRef(crypto.randomUUID());
+  const [savedDraft,setSavedDraft]=useState(false);
   const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
@@ -164,12 +169,13 @@ export function CopilotWidget() {
     setError(null);
     setPending(true);
     try {
-      const res = await apiRequest("POST", "/api/copilot/chat", { messages: history });
+      const res = await apiRequest("POST", "/api/copilot/chat", { messages: history,requestId:requestId.current });
       const data = await res.json();
       if (typeof data?.reply !== "string" || !data.reply.trim() || data.reply.trim() === "(empty response)") {
         throw new Error("The model returned no answer text. Please retry your last message.");
       }
       setMessages([...history, { role: "assistant", content: data.reply.trim() }]);
+      if(data.draft){setSavedDraft(true);queryClient.invalidateQueries({queryKey:["/api/copilot/drafts"]});}
     } catch (err) {
       setError(readableError(err));
     } finally {
@@ -180,6 +186,7 @@ export function CopilotWidget() {
   function send(text: string) {
     const trimmed = text.trim();
     if (!trimmed || pending) return;
+    requestId.current=crypto.randomUUID();
     const next: Msg[] = [...messages, { role: "user", content: trimmed }];
     setMessages(next);
     setInput("");
@@ -224,7 +231,7 @@ export function CopilotWidget() {
                 <h2 className="truncate text-sm font-semibold text-foreground">Copilot</h2>
               </div>
               <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
-                Advice only · reads your live book
+                Recommendations and editable drafts · no execution
               </p>
             </div>
             <div className="flex items-center gap-1">
@@ -254,6 +261,7 @@ export function CopilotWidget() {
               </button>
             </div>
           </header>
+          {savedDraft&&<button className="border-b border-border px-4 py-2 text-left text-sm text-primary" onClick={()=>{navigate("/strategy");setOpen(false);}}>Review saved recommendation drafts in Strategy</button>}
 
           <div ref={scrollRef} className="flex-1 overflow-y-auto [overscroll-behavior:contain] px-4 py-3">
             {!configured ? (

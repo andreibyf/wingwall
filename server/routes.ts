@@ -28,9 +28,11 @@ import {
 import { computeFlyPricing, getMultiplier, type ChainLeg } from "@shared/flyMath";
 import { z } from "zod";
 import { runAutoTrade, tradingWeek } from "./auto-trade";
-import { freshQuote, paperMode } from "./automation-policy";
+import { freshQuote } from "./automation-policy";
+import {paperMode,setAutomationMode} from "./automation-control";
 import { workerStatus } from "./paper-worker";
 import { registerStrategyRoutes } from "./strategy-store";
+import {registerDraftRoutes,saveRecommendationDraft,draftForRequest} from "./recommendation-drafts";
 import { resolveExitPolicy, assessThresholdReachability } from "@shared/exit-policy";
 import { getIbkrFlyQuote, isIbkrSupported, IbkrPricingError } from "./ibkr";
 import {
@@ -211,6 +213,17 @@ export async function registerRoutes(
   registerStrategyRoutes(app);
   app.get("/api/automation/status",async(_req,res,next)=>{
     try {res.json(await workerStatus());} catch(err){next(err);}
+  });
+  app.put("/api/automation/mode",async(req,res,next)=>{
+    try {
+      const input=z.object({mode:z.enum(["observe","paper"]),version:z.number().int().positive(),acknowledge:z.literal(true)}).strict().parse(req.body);
+      if(input.mode==="paper") {
+        const status=await workerStatus();
+        if(!status.healthy||!status.operatorConfigured)return res.status(409).json({message:"Paper mode requires a healthy worker and operator authentication. No settings changed."});
+      }
+      const control=await setAutomationMode(input.mode,input.version);
+      res.json({...control,entryArmed:false,message:"Mode saved. New entries are off. Drafts remain non-executable."});
+    }catch(err){next(err);}
   });
   // ---- Live fly pricing (IBKR-first, Cboe fallback) ----
   // Fetches real-time bid/ask for exactly the 3 legs of a fly — not a full chain.
@@ -645,7 +658,7 @@ export async function registerRoutes(
       const typed = insertSettingsSchema.partial().parse(req.body);
       if(typed.autoTradeEnabled===true) {
         const status=await workerStatus();
-        if(paperMode()!=="paper" || !status.healthy || !status.operatorConfigured) {
+        if(await paperMode()!=="paper" || !status.healthy || !status.operatorConfigured) {
           return res.status(409).json({message:"Entry cannot be armed until paper-write mode, operator authentication, and a healthy worker are verified."});
         }
       }
@@ -897,13 +910,17 @@ export async function registerRoutes(
         return res.status(400).json({ message: "No valid messages provided" });
       }
 
+      const requestId=z.string().uuid().parse(req.body.requestId??crypto.randomUUID());
+      const existing=await draftForRequest(requestId);
+      if(existing)return res.json({reply:"This request already saved a recommendation draft. Review it in Strategy → Recommendation drafts. No trade was executed.",model:copilotModel,draft:existing});
       const snapshot = await buildSignalSnapshot(getFlyLivePricing, getChain);
-      const result = await runCopilotChat(messages, snapshot);
+      const result = await runCopilotChat(messages, snapshot,(input,model)=>saveRecommendationDraft(input,requestId,model));
       res.json(result);
     } catch (err) {
       next(err);
     }
   });
 
+  registerDraftRoutes(app);
   return httpServer;
 }

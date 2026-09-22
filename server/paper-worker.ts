@@ -2,7 +2,8 @@ import { db, storage } from "./storage";
 import { sql } from "drizzle-orm";
 import { runAutoTrade, type AutoTradeDeps } from "./auto-trade";
 import { commitPaperExit } from "./paper-ledger";
-import { eastern, entryWindow, exitReason, freshQuote, marketOpen, paperMode } from "./automation-policy";
+import { eastern, entryWindow, exitReason, freshQuote, marketOpen } from "./automation-policy";
+import {paperMode,automationControl} from "./automation-control";
 import { operatorConfigured } from "./operator-auth";
 import {runSpreadLearning} from "./spread-learning";
 
@@ -14,7 +15,19 @@ export async function workerStatus() {
   const lastCompleted=rows.rows.find(r=>r.finished_at);
   const healthy=heartbeatFresh && Boolean(lastCompleted && Date.now()-new Date(lastCompleted.finished_at as string).getTime()<180_000) && lastCompleted?.outcome==="ok";
   const settings=await storage.getSettings();
-  return {paperOnly:true,mode:paperMode(),entryArmed:settings?.autoTradeEnabled===true,
+  const control=await automationControl();
+  const window=entryWindow();
+  const blockers=[
+    ...(control.mode!=="paper"?["Observe mode: no automatic entries or exits"]:[]),
+    ...(process.env.PAPER_ENTRY_ENABLED==="false"?["Deployment entry lock is on; UI cannot override it"]:[]),
+    ...(!settings?.autoTradeEnabled?["Master Auto entry switch is off"]:[]),
+    ...(!healthy?["Worker heartbeat or completion is unhealthy"]:[]),
+    ...(!operatorConfigured()?["Operator authentication is not configured"]:[]),
+    ...(!window.allowed?[window.reason]:[]),
+  ];
+  return {paperOnly:true,mode:control.mode,modeControl:control,blockers,
+    quoteReadiness:"Not certified by heartbeat. Fresh quotes, current checklist evidence and risk limits are checked for each decision.",
+    entryArmed:settings?.autoTradeEnabled===true,
     entryLocked:process.env.PAPER_ENTRY_ENABLED==="false",
     exitsEnabled:process.env.PAPER_EXIT_ENABLED!=="false",heartbeatFresh,healthy,
     operatorConfigured:operatorConfigured(),quoteMaxAgeSeconds:120,
@@ -32,7 +45,7 @@ export async function runPaperWorker(deps:AutoTradeDeps & {quote:QuoteFn}) {
       detail='{"alert":"Previous worker stopped before completion; writes must be reconciled from ledger"}'
       WHERE finished_at IS NULL AND started_at < now()-interval '3 minutes'`);
     const inserted=await client.query(`INSERT INTO paper_worker_runs(run_key,mode,outcome)
-      VALUES($1,$2,'running') ON CONFLICT DO NOTHING RETURNING run_key`,[key,paperMode()]);
+      VALUES($1,$2,'running') ON CONFLICT DO NOTHING RETURNING run_key`,[key,await paperMode()]);
     if(!inserted.rowCount) return {outcome:"already_ran"};
     const detail:any={entry:null,exits:[],alerts:[]};
     try {
@@ -52,7 +65,7 @@ export async function runPaperWorker(deps:AutoTradeDeps & {quote:QuoteFn}) {
             }
             const reason=exitReason(fly,quote.midDebit,settings,deps.now??new Date());
             if(!reason) {detail.exits.push({flyId:fly.id,outcome:"no_trigger"});continue;}
-            if(paperMode()==="observe" || process.env.PAPER_EXIT_ENABLED==="false") {
+            if(await paperMode()==="observe" || process.env.PAPER_EXIT_ENABLED==="false") {
               detail.exits.push({flyId:fly.id,outcome:"would_close",reason,quoteTimestamp:quote.timestamp});
             } else {
               if(!operatorConfigured()) throw Error("Operator authentication not configured");
@@ -68,7 +81,8 @@ export async function runPaperWorker(deps:AutoTradeDeps & {quote:QuoteFn}) {
           AND detail->'entry' IS NOT NULL AND detail->'entry'<>'null'::jsonb
           AND started_at > now()-interval '5 minutes' LIMIT 1`);
         if(!recent.rowCount && entryWindow(now).allowed) {
-          detail.entry=await runAutoTrade(deps,{dryRun:paperMode()==="observe",ignoreToggle:paperMode()==="observe"});
+          const observing=await paperMode()==="observe";
+          detail.entry=await runAutoTrade(deps,{dryRun:observing,ignoreToggle:observing});
           if(detail.entry.outcome==="error" || detail.entry.verdict?.parseError || /quote|timestamp/i.test(detail.entry.detail??"")) {
             detail.alerts.push(`Entry blocked: ${detail.entry.detail}`);
           }
