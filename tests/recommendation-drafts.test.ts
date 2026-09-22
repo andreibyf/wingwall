@@ -20,6 +20,10 @@ test("completed draft tool persists once and returns server-owned acknowledgment
     {type:"text",text:"I executed a trade"}, {type:"tool_use",name:draftTool.name,input:draft}
   ]}),8192,"test",async input=>{writes++;recommendationDraftSchema.parse(input);return{id:1};});
   assert.equal(writes,1);assert.deepEqual(r.draft,{id:1});assert.doesNotMatch(r.reply,/I executed/);
+  assert.ok(r.reply.split(/\s+/).length<=35);
+  assert.match(r.reply,/Strategy → Recommendation drafts/);
+  assert.match(r.reply,/No position created, checklist approved, or automation armed/);
+  assert.match(r.reply,/Verify missing evidence/);
 });
 test("truncated, unknown, multiple or malformed tools never save",async()=>{
   for(const response of [
