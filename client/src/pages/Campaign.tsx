@@ -11,6 +11,7 @@ import {
 } from "@/lib/hooks";
 import { fmtUsd, fmtPct, weekOfMonday } from "@/lib/format";
 import { selectWallForWeek } from "@/lib/walls";
+import { DuplicateWallResolver } from "@/components/DuplicateWallResolver";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -351,18 +352,8 @@ export default function Campaign() {
             <Textarea data-testid="input-wall-notes" value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} />
           </div>
 
-          {wallDuplicates.length > 0 && (
-            <div
-              className="rounded-md border border-chart-3/40 bg-chart-3/10 px-3 py-2 text-xs text-chart-3"
-              data-testid="warning-duplicate-walls"
-            >
-              {wallDuplicates.length + 1} walls exist for {symbol} week of {weekOf}. This page is
-              editing the most recent (id {existing?.id}); id
-              {wallDuplicates.length > 1 ? "s" : ""} {wallDuplicates.map((w) => w.id).join(", ")}{" "}
-              {wallDuplicates.length > 1 ? "are" : "is"} being ignored but still stored. Saving here
-              updates the newest only — delete the others below if they are not wanted. They are
-              left in place because a stale wall may still hold notes worth reading.
-            </div>
+          {existing && wallDuplicates.length > 0 && (
+            <DuplicateWallResolver symbol={symbol} weekOf={weekOf} kept={existing} duplicates={wallDuplicates} />
           )}
 
           <Button onClick={handleSaveWall} disabled={createWall.isPending || updateWall.isPending} data-testid="button-save-wall">
