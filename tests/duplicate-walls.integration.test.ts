@@ -53,6 +53,11 @@ after(async () => {
 beforeEach(async () => {
   await sql.query("DROP TRIGGER IF EXISTS fail_delete ON campaign_walls");
   await sql.query("TRUNCATE flies, campaign_walls RESTART IDENTITY");
+  // ensureSchema now creates a unique index on (symbol, week_of), which makes new duplicates
+  // impossible. These fixtures model a LEGACY database whose duplicates predate that index -- the
+  // case resolution exists for -- so the index is dropped first. The tests at the end of this file
+  // cover the index itself.
+  await sql.query("DROP INDEX IF EXISTS campaign_walls_symbol_week_uniq");
   await sql.query(`
     INSERT INTO campaign_walls
       (symbol, week_of, wall_price, reference_close, active_branch, gap_percent, re_keyed, notes, created_at)
@@ -192,4 +197,53 @@ test("waits for an in-flight insert, then rejects the stale review", async () =>
     writer.release();
     await pending;
   }
+});
+
+
+// ---- Uniqueness going forward ------------------------------------------------------------------
+
+const UNIQ = "campaign_walls_symbol_week_uniq";
+async function indexExists() {
+  return (await sql.query("SELECT 1 FROM pg_indexes WHERE indexname = $1", [UNIQ])).rowCount === 1;
+}
+async function postWall(body: Record<string, unknown>) {
+  const response = await fetch(`${base}/api/campaign`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  return { status: response.status, body: await response.json() };
+}
+
+test("ensureSchema skips the unique index while duplicates exist, then creates it once resolved", async () => {
+  const { ensureSchema } = await import("../server/storage.ts");
+  await ensureSchema();
+  assert.equal(await indexExists(), false, "index must not be created over existing duplicates");
+  assert.equal((await resolve({ keepId: 2, duplicateIds: [1] })).status, 200);
+  await ensureSchema();
+  assert.equal(await indexExists(), true, "index must be created once the week is unambiguous");
+  await assert.rejects(
+    sql.query("INSERT INTO campaign_walls (symbol, week_of, wall_price, created_at) VALUES ('QQQ', '2026-09-14', 999, 'x')"),
+    /campaign_walls_symbol_week_uniq/,
+  );
+});
+
+test("POST /api/campaign updates an existing week in place instead of inserting a duplicate", async () => {
+  await sql.query("DELETE FROM campaign_walls WHERE id = 1");
+  const { ensureSchema } = await import("../server/storage.ts");
+  await ensureSchema();
+  assert.equal(await indexExists(), true);
+  const wall = { symbol: "QQQ", weekOf: "2026-09-21", wallPrice: 745, referenceClose: 721,
+    activeBranch: "rejects", gapPercent: null, reKeyed: false, notes: "re-keyed" };
+  const updated = await postWall(wall);
+  assert.equal(updated.status, 200);
+  assert.equal(updated.body.id, 4);
+  assert.equal(updated.body.wallPrice, 745);
+  const rows = (await sql.query("SELECT id FROM campaign_walls WHERE symbol = 'QQQ' AND week_of = '2026-09-21'")).rows;
+  assert.deepEqual(rows.map((r) => r.id), [4]);
+});
+
+test("POST /api/campaign still creates a wall for a week that has none", async () => {
+  const created = await postWall({ symbol: "QQQ", weekOf: "2026-09-28", wallPrice: 750, referenceClose: null,
+    activeBranch: "pending", gapPercent: null, reKeyed: false, notes: null });
+  assert.equal(created.status, 201);
+  assert.equal(created.body.weekOf, "2026-09-28");
 });
