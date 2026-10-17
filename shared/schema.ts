@@ -37,14 +37,58 @@ export const flies = pgTable("flies", {
   campaignWallId: integer("campaign_wall_id"),
   notes: text("notes"),
   // Running high-water-mark (best) / low-water-mark (worst) of unrealized P&L, expressed as a
-  // fraction of maxProfit / maxLoss respectively, sampled continuously while the position is
-  // open (via the server-side tracking job — see server/peakTracker.ts). Powers the Journal's
-  // threshold-review table: did this trade ever cross the take-profit or stop-loss threshold
-  // before it closed, regardless of what the exit debit ended up being.
+  // fraction of maxProfit / maxLoss respectively. Powers the Journal's threshold-review table:
+  // did this trade ever cross the take-profit or stop-loss threshold before it closed,
+  // regardless of what the exit debit ended up being.
+  //
+  // NOT sampled continuously, and there is no server/peakTracker.ts -- an earlier version of
+  // this comment claimed both. They ratchet inside storage.trackFlyExtreme, which only runs
+  // when GET /api/exit-check is called: roughly eight times a session from the exit-watch job,
+  // plus whenever the app is open. So a recorded extreme is a LOWER BOUND on the true extreme,
+  // and a threshold the record shows as untouched may have been touched between samples.
+  // shared/learning.ts depends on that distinction and labels such findings boundedBelow.
   peakProfitPct: real("peak_profit_pct"),
   peakLossPct: real("peak_loss_pct"),
+  // When each extreme was set. Without these only the two extremes are known and never their
+  // order, so a trade that crossed BOTH thresholds cannot say which would have fired -- the
+  // one case where sequence decides the outcome. Null on trades predating this column.
+  peakProfitAt: text("peak_profit_at"),
+  peakLossAt: text("peak_loss_at"),
+  // Decision capture. The learning loop was specified as "compare outcome vs thesis" and could
+  // not be built, because nothing recorded the thesis: every fly closed before this carried
+  // campaign_wall_id null and notes null. entryBranch is a SNAPSHOT, not a lookup through
+  // campaignWallId -- the wall's activeBranch is mutable and re-keyable, so reading it later
+  // would score a trade against a thesis it was never taken under.
+  entryBranch: text("entry_branch"),
+  entryThesis: text("entry_thesis"),
+  entryWall: real("entry_wall"),
+  entrySpot: real("entry_spot"),
+  // Exit policy in force at close, as JSON. Settings are global and mutable, so without this
+  // the thresholds a closed trade was actually judged against are unreconstructable.
+  policyAtClose: text("policy_at_close"),
   createdAt: text("created_at").notNull(),
 });
+
+// One review per closed fly, regenerated on demand. Stored rather than computed per request so
+// a review can be read back exactly as it was written, and so the observation codes can later
+// be aggregated without re-deriving them from prose.
+export const tradeReviews = pgTable("trade_reviews", {
+  id: serial("id").primaryKey(),
+  flyId: integer("fly_id").notNull().unique(),
+  generatedAt: text("generated_at").notNull(),
+  realizedPnl: real("realized_pnl"),
+  realizedMultiple: real("realized_multiple"),
+  peakMultiple: real("peak_multiple"),
+  thesisAvailable: boolean("thesis_available").notNull().default(false),
+  /** JSON array of ReviewObservation. */
+  observations: text("observations").notNull(),
+  /** JSON array of strings. Non-empty for any trade predating decision capture. */
+  unknowns: text("unknowns").notNull(),
+});
+
+export const insertTradeReviewSchema = createInsertSchema(tradeReviews).omit({ id: true });
+export type InsertTradeReview = z.infer<typeof insertTradeReviewSchema>;
+export type TradeReviewRow = typeof tradeReviews.$inferSelect;
 
 export const insertFlySchema = createInsertSchema(flies).omit({
   id: true,

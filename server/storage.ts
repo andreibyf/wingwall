@@ -1,4 +1,4 @@
-import { users, flies, campaignWalls, settings, executionChecklist, journalNotes } from '@shared/schema';
+import { users, flies, campaignWalls, settings, executionChecklist, journalNotes, tradeReviews } from '@shared/schema';
 import type {
   User,
   InsertUser,
@@ -15,7 +15,7 @@ import type {
 } from '@shared/schema';
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { eq, desc, sql } from "drizzle-orm";
+import { eq, desc, sql, and } from "drizzle-orm";
 
 if (!process.env.DATABASE_URL) {
   throw new Error("DATABASE_URL is required (Render Postgres connection string)");
@@ -72,7 +72,25 @@ CREATE TABLE IF NOT EXISTS flies (
   notes TEXT,
   peak_profit_pct REAL,
   peak_loss_pct REAL,
+  peak_profit_at TEXT,
+  peak_loss_at TEXT,
+  entry_branch TEXT,
+  entry_thesis TEXT,
+  entry_wall REAL,
+  entry_spot REAL,
+  policy_at_close TEXT,
   created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS trade_reviews (
+  id SERIAL PRIMARY KEY,
+  fly_id INTEGER NOT NULL UNIQUE,
+  generated_at TEXT NOT NULL,
+  realized_pnl REAL,
+  realized_multiple REAL,
+  peak_multiple REAL,
+  thesis_available BOOLEAN NOT NULL DEFAULT false,
+  observations TEXT NOT NULL,
+  unknowns TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS campaign_walls (
   id SERIAL PRIMARY KEY,
@@ -141,6 +159,71 @@ CREATE TABLE IF NOT EXISTS spread_decisions (
 CREATE TABLE IF NOT EXISTS trade_reflections (
   id SERIAL PRIMARY KEY,position_id INTEGER NOT NULL REFERENCES spread_positions(id),text TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+`);
+
+  // Uniqueness for campaign walls on (symbol, week_of).
+  //
+  // Nothing enforced this, so a POST could insert a second wall for a week the operator had
+  // already keyed, and the readers then silently picked one of them. The route now updates in
+  // place instead of inserting, but the constraint is what makes the duplicate structurally
+  // impossible rather than merely unlikely.
+  //
+  // Created defensively. CREATE UNIQUE INDEX fails outright if duplicates already exist, and
+  // this runs at boot -- so an unguarded attempt would turn pre-existing duplicate rows into a
+  // service that will not start. The duplicates are checked FIRST, and if any are present the
+  // index is skipped and the conflict is logged loudly. Deliberately no automatic cleanup: the
+  // rows may carry notes, and choosing which to discard is the operator's call, not a
+  // migration's.
+  {
+    const dupes = await pool.query(`
+      SELECT symbol, week_of, COUNT(*) AS n, ARRAY_AGG(id ORDER BY id) AS ids
+        FROM campaign_walls
+    GROUP BY symbol, week_of
+      HAVING COUNT(*) > 1
+    `);
+    if (dupes.rows.length > 0) {
+      for (const r of dupes.rows) {
+        console.warn(
+          `[schema] campaign_walls has ${r.n} rows for ${r.symbol} week_of ${r.week_of} ` +
+            `(ids ${(r.ids as number[]).join(", ")}). The app uses the highest id and flags the ` +
+            `rest in the UI. Uniqueness NOT enforced until these are resolved by hand.`
+        );
+      }
+    } else {
+      await pool.query(
+        `CREATE UNIQUE INDEX IF NOT EXISTS campaign_walls_symbol_week_uniq
+           ON campaign_walls (symbol, week_of)`
+      );
+    }
+  }
+
+  // Additive migration: decision capture and review storage.
+  //
+  // Same mechanism and same constraints as the blocks around it: ADD COLUMN IF NOT EXISTS
+  // only, nothing dropped, renamed or retyped, so the previous release keeps running against a
+  // migrated database and simply ignores the columns. All are NULLABLE on purpose -- the three
+  // already-closed flies genuinely have no branch, thesis or policy, and a NOT NULL default
+  // would invent one. A null here has to keep meaning "never recorded", because that is what
+  // shared/learning.ts reports as an unknown rather than scoring against a fabricated thesis.
+  await pool.query(`
+ALTER TABLE flies ADD COLUMN IF NOT EXISTS peak_profit_at TEXT;
+ALTER TABLE flies ADD COLUMN IF NOT EXISTS peak_loss_at TEXT;
+ALTER TABLE flies ADD COLUMN IF NOT EXISTS entry_branch TEXT;
+ALTER TABLE flies ADD COLUMN IF NOT EXISTS entry_thesis TEXT;
+ALTER TABLE flies ADD COLUMN IF NOT EXISTS entry_wall REAL;
+ALTER TABLE flies ADD COLUMN IF NOT EXISTS entry_spot REAL;
+ALTER TABLE flies ADD COLUMN IF NOT EXISTS policy_at_close TEXT;
+CREATE TABLE IF NOT EXISTS trade_reviews (
+  id SERIAL PRIMARY KEY,
+  fly_id INTEGER NOT NULL UNIQUE,
+  generated_at TEXT NOT NULL,
+  realized_pnl REAL,
+  realized_multiple REAL,
+  peak_multiple REAL,
+  thesis_available BOOLEAN NOT NULL DEFAULT false,
+  observations TEXT NOT NULL,
+  unknowns TEXT NOT NULL
 );
 `);
 
@@ -399,6 +482,7 @@ export interface IStorage {
 
   listCampaignWalls(): Promise<CampaignWall[]>;
   getCampaignWall(id: number): Promise<CampaignWall | undefined>;
+  findCampaignWallForWeek(symbol: string, weekOf: string): Promise<CampaignWall | undefined>;
   createCampaignWall(wall: InsertCampaignWall): Promise<CampaignWall>;
   updateCampaignWall(id: number, wall: Partial<InsertCampaignWall>): Promise<CampaignWall | undefined>;
   deleteCampaignWall(id: number): Promise<void>;
@@ -481,15 +565,72 @@ export class DatabaseStorage implements IStorage {
     await db.delete(flies).where(eq(flies.id, id));
   }
 
+  // ---- trade reviews ---------------------------------------------------------------------
+
+  /** Upsert on fly_id: regenerating a review replaces it rather than accumulating versions. */
+  async putTradeReview(row: {
+    flyId: number;
+    realizedPnl: number | null;
+    realizedMultiple: number | null;
+    peakMultiple: number | null;
+    thesisAvailable: boolean;
+    observations: string;
+    unknowns: string;
+  }): Promise<void> {
+    await pool.query(
+      `INSERT INTO trade_reviews
+         (fly_id, generated_at, realized_pnl, realized_multiple, peak_multiple,
+          thesis_available, observations, unknowns)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       ON CONFLICT (fly_id) DO UPDATE SET
+         generated_at = EXCLUDED.generated_at,
+         realized_pnl = EXCLUDED.realized_pnl,
+         realized_multiple = EXCLUDED.realized_multiple,
+         peak_multiple = EXCLUDED.peak_multiple,
+         thesis_available = EXCLUDED.thesis_available,
+         observations = EXCLUDED.observations,
+         unknowns = EXCLUDED.unknowns`,
+      [
+        row.flyId,
+        new Date().toISOString(),
+        row.realizedPnl,
+        row.realizedMultiple,
+        row.peakMultiple,
+        row.thesisAvailable,
+        row.observations,
+        row.unknowns,
+      ],
+    );
+  }
+
+  async listTradeReviews(): Promise<Array<Record<string, unknown>>> {
+    const res = await pool.query(
+      `SELECT fly_id, generated_at, realized_pnl, realized_multiple, peak_multiple,
+              thesis_available, observations, unknowns
+         FROM trade_reviews ORDER BY fly_id DESC`,
+    );
+    return res.rows;
+  }
+
   async trackFlyExtreme(id: number, profitPct: number, lossPct: number): Promise<Fly | undefined> {
     const fly = await this.getFly(id);
     if (!fly || fly.status !== "open") return fly;
     const nextPeakProfit = Math.max(fly.peakProfitPct ?? -Infinity, profitPct);
     const nextPeakLoss = Math.min(fly.peakLossPct ?? Infinity, lossPct);
     if (nextPeakProfit === fly.peakProfitPct && nextPeakLoss === fly.peakLossPct) return fly; // no new extreme
+    // Stamp only the extreme that actually moved. Stamping both on every ratchet would make
+    // the two timestamps equal and destroy the ordering these columns exist to preserve.
+    const now = new Date().toISOString();
+    const profitMoved = nextPeakProfit !== fly.peakProfitPct;
+    const lossMoved = nextPeakLoss !== fly.peakLossPct;
     const rows = await db
       .update(flies)
-      .set({ peakProfitPct: nextPeakProfit, peakLossPct: nextPeakLoss })
+      .set({
+        peakProfitPct: nextPeakProfit,
+        peakLossPct: nextPeakLoss,
+        ...(profitMoved ? { peakProfitAt: now } : {}),
+        ...(lossMoved ? { peakLossAt: now } : {}),
+      })
       .where(eq(flies.id, id))
       .returning();
     return rows[0];
@@ -501,6 +642,22 @@ export class DatabaseStorage implements IStorage {
 
   async getCampaignWall(id: number): Promise<CampaignWall | undefined> {
     const rows = await db.select().from(campaignWalls).where(eq(campaignWalls.id, id));
+    return rows[0];
+  }
+
+  /**
+   * The wall for a symbol and week, newest first. Mirrors the client's selectWallForWeek so the
+   * server's idea of "the" wall for a week cannot diverge from what the UI shows.
+   */
+  async findCampaignWallForWeek(
+    symbol: string,
+    weekOf: string
+  ): Promise<CampaignWall | undefined> {
+    const rows = await db
+      .select()
+      .from(campaignWalls)
+      .where(and(eq(campaignWalls.symbol, symbol), eq(campaignWalls.weekOf, weekOf)))
+      .orderBy(desc(campaignWalls.id));
     return rows[0];
   }
 

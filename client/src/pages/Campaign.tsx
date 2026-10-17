@@ -10,6 +10,7 @@ import {
   useUpdateChecklist,
 } from "@/lib/hooks";
 import { fmtUsd, fmtPct, weekOfMonday } from "@/lib/format";
+import { selectWallForWeek } from "@/lib/walls";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -207,8 +208,10 @@ export default function Campaign() {
     return { blocked: false, reason: null, gap: level - spot };
   }, [gexLevels]);
 
-  const existing = useMemo(
-    () => (walls ?? []).find((w) => w.symbol === symbol && w.weekOf === weekOf),
+  // Shared with the Builder so both pages resolve the same wall for the week (highest id). While
+  // duplicates exist, saving is blocked and the resolve panel below is the way out.
+  const { wall: existing } = useMemo(
+    () => selectWallForWeek(walls, symbol, weekOf),
     [walls, symbol, weekOf]
   );
   const queryClient = useQueryClient();

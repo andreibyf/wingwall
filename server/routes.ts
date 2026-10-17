@@ -1,4 +1,5 @@
 import type { Express } from "express";
+import { reviewTrade, aggregate } from "@shared/learning";
 import { createServer } from 'node:http';
 import type { Server } from 'node:http';
 import {
@@ -207,6 +208,81 @@ export async function getFlyLivePricing(
   };
 }
 
+/**
+ * Build and persist the review for one closed fly. Returns null when the fly is missing or
+ * still open -- reviewing an open trade would score a path that has not finished.
+ */
+async function generateReview(flyId: number) {
+  const fly = await storage.getFly(flyId);
+  if (!fly || fly.status !== "closed") return null;
+
+  // Prefer the policy snapshotted at close. Falling back to CURRENT settings would judge an
+  // old trade against thresholds that were not in force when it closed, which is the precise
+  // error this whole exercise exists to stop making -- so when there is no snapshot, the
+  // policy is passed as null and the review reports it as an unknown instead.
+  let policy: {
+    takeProfitMode: string;
+    takeProfitValue: number;
+    stopLossPctOfMaxLoss: number;
+  } | null = null;
+  if (fly.policyAtClose) {
+    try {
+      const p = JSON.parse(fly.policyAtClose);
+      if (
+        typeof p?.takeProfitMode === "string" &&
+        typeof p?.takeProfitValue === "number" &&
+        typeof p?.stopLossPctOfMaxLoss === "number"
+      ) {
+        policy = {
+          takeProfitMode: p.takeProfitMode,
+          takeProfitValue: p.takeProfitValue,
+          stopLossPctOfMaxLoss: p.stopLossPctOfMaxLoss,
+        };
+      }
+    } catch {
+      // Malformed snapshot is treated as absent, not as an excuse to substitute live settings.
+    }
+  }
+
+  const review = reviewTrade({
+    fly: {
+      id: fly.id,
+      optionType: fly.optionType,
+      lowerStrike: fly.lowerStrike,
+      middleStrike: fly.middleStrike,
+      upperStrike: fly.upperStrike,
+      contracts: fly.contracts,
+      entryDebit: fly.entryDebit,
+      exitDebit: fly.exitDebit ?? null,
+      entryDate: fly.entryDate,
+      exitDate: fly.exitDate ?? null,
+      maxLoss: fly.maxLoss,
+      maxProfit: fly.maxProfit,
+      peakProfitPct: fly.peakProfitPct ?? null,
+      peakLossPct: fly.peakLossPct ?? null,
+      peakProfitAt: fly.peakProfitAt ?? null,
+      peakLossAt: fly.peakLossAt ?? null,
+      entryBranch: fly.entryBranch ?? null,
+      entryThesis: fly.entryThesis ?? null,
+      entryWall: fly.entryWall ?? null,
+      entrySpot: fly.entrySpot ?? null,
+    },
+    policy,
+  });
+
+  await storage.putTradeReview({
+    flyId: review.flyId,
+    realizedPnl: review.realizedPnl,
+    realizedMultiple: review.realizedMultiple,
+    peakMultiple: review.peakMultiple,
+    thesisAvailable: review.thesisAvailable,
+    observations: JSON.stringify(review.observations),
+    unknowns: JSON.stringify(review.unknowns),
+  });
+
+  return review;
+}
+
 export async function registerRoutes(
   httpServer: Server,
   app: Express
@@ -363,9 +439,109 @@ export async function registerRoutes(
     try {
       const id = parseInt(req.params.id, 10);
       const parsed = insertFlySchema.partial().parse(req.body);
-      const updated = await storage.updateFly(id, parsed);
+
+      // Snapshot the exit policy at the moment of close. Settings are global and mutable, so
+      // the thresholds a trade was judged against are otherwise unreconstructable later --
+      // which is exactly the gap that left the three existing closed flies unreviewable.
+      // Only stamped on the open -> closed transition, and never overwritten, so re-patching a
+      // closed fly cannot rewrite the policy it actually closed under.
+      const before = await storage.getFly(id);
+      const closingNow =
+        parsed.status === "closed" && before !== undefined && before.status !== "closed";
+      const patch = { ...parsed };
+      if (closingNow && !before.policyAtClose) {
+        const st = await storage.getSettings();
+        patch.policyAtClose = JSON.stringify({
+          takeProfitMode: st.takeProfitMode,
+          takeProfitValue: st.takeProfitValue,
+          stopLossPctOfMaxLoss: st.stopLossPctOfMaxLoss,
+          snapshotAt: new Date().toISOString(),
+        });
+      }
+
+      const updated = await storage.updateFly(id, patch);
       if (!updated) return res.status(404).json({ message: "Fly not found" });
+
+      // Generate the review on close. Deliberately non-fatal: a review is a reflection on a
+      // trade, and failing to write one must never make the CLOSE itself look like it failed.
+      // The auto-exit job PATCHes here, so throwing would turn a successful risk-reducing exit
+      // into an error the operator has to unpick during market hours.
+      if (closingNow) {
+        try {
+          await generateReview(updated.id);
+        } catch (e) {
+          console.error(`[learning] review generation failed for fly ${updated.id}:`, e);
+        }
+      }
+
       res.json(updated);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ---- learning loop ----------------------------------------------------------------------
+
+  app.post("/api/learning/review/:flyId", async (req, res, next) => {
+    try {
+      const flyId = parseInt(req.params.flyId, 10);
+      const review = await generateReview(flyId);
+      if (review === null) {
+        return res.status(400).json({
+          message: "Only closed flies can be reviewed, and the fly must exist.",
+        });
+      }
+      res.json(review);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Backfill: review every closed fly that has no review yet. Safe to re-run -- putTradeReview
+  // upserts on fly_id.
+  app.post("/api/learning/review-all", async (_req, res, next) => {
+    try {
+      const all = await storage.listFlies();
+      const closed = all.filter((f) => f.status === "closed");
+      const out = [];
+      for (const f of closed) {
+        const r = await generateReview(f.id);
+        if (r) out.push(r);
+      }
+      res.json({ reviewed: out.length, reviews: out });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get("/api/learning/reviews", async (_req, res, next) => {
+    try {
+      const rows = await storage.listTradeReviews();
+      const flies = await storage.listFlies();
+      const byId = new Map(flies.map((f) => [f.id, f]));
+      const reviews = rows.map((r) => ({
+        flyId: r.fly_id as number,
+        generatedAt: r.generated_at as string,
+        realizedPnl: r.realized_pnl as number | null,
+        realizedMultiple: r.realized_multiple as number | null,
+        peakMultiple: r.peak_multiple as number | null,
+        thesisAvailable: r.thesis_available as boolean,
+        observations: JSON.parse(r.observations as string),
+        unknowns: JSON.parse(r.unknowns as string),
+      }));
+      const agg = aggregate(
+        reviews.map((r) => ({
+          flyId: r.flyId,
+          realizedPnl: r.realizedPnl,
+          realizedMultiple: r.realizedMultiple,
+          peakMultiple: r.peakMultiple,
+          observations: r.observations,
+          unknowns: r.unknowns,
+          thesisAvailable: r.thesisAvailable,
+        })),
+        reviews.map((r) => byId.get(r.flyId)?.entryBranch ?? null),
+      );
+      res.json({ reviews, aggregate: agg });
     } catch (err) {
       next(err);
     }
@@ -429,9 +605,22 @@ export async function registerRoutes(
     }
   });
 
+  // Upsert on (symbol, weekOf) rather than a blind insert.
+  //
+  // A week can only have one wall, but nothing enforced that, so re-keying through this endpoint
+  // -- or a retried request -- left two rows for the same week and the readers silently picked
+  // one. Done in application code rather than ON CONFLICT because the unique index is skipped
+  // when pre-existing duplicates are present, and this path has to behave identically either way.
   app.post("/api/campaign", async (req, res, next) => {
     try {
       const parsed = insertCampaignWallSchema.parse(req.body);
+      const existing = await storage.findCampaignWallForWeek(parsed.symbol, parsed.weekOf);
+      if (existing) {
+        const updated = await storage.updateCampaignWall(existing.id, parsed);
+        // 200, not 201: nothing was created. A client that distinguishes the two should see the
+        // difference rather than be told it made a new row.
+        return res.status(200).json(updated);
+      }
       res.status(201).json(await storage.createCampaignWall(parsed));
     } catch (err) {
       next(err);
